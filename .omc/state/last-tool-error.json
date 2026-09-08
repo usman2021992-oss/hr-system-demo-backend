@@ -1,0 +1,7 @@
+{
+  "tool_name": "Bash",
+  "tool_input_preview": "{\"command\":\"cd /Users/user/hr-software && git stash pop\",\"description\":\"Restore timezone fix changes\"}",
+  "error": "Exit code 1\nNo stash entries found.",
+  "timestamp": "2026-04-19T12:48:22.696Z",
+  "retry_count": 1
+}

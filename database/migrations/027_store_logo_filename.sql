@@ -1,0 +1,6 @@
+BEGIN;
+
+ALTER TABLE stores
+  ADD COLUMN IF NOT EXISTS logo_filename VARCHAR(255);
+
+COMMIT;

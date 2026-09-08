@@ -1,0 +1,37 @@
+# Standalone Dockerfile — used when this backend/ directory is its own Git repo.
+# Railway builds from the repo root, so paths are relative to backend/ contents.
+
+# ── Build stage ──────────────────────────────────────────────
+FROM node:20-alpine AS builder
+WORKDIR /app
+
+COPY package*.json ./
+RUN npm install
+
+COPY tsconfig.json ./
+COPY src ./src
+RUN npm run build
+
+# ── Production stage ──────────────────────────────────────────
+FROM node:20-alpine AS runner
+WORKDIR /app
+
+ENV NODE_ENV=production
+
+COPY package*.json ./
+RUN npm install --omit=dev
+
+# Compiled JS
+COPY --from=builder /app/dist ./dist
+
+# Migration files are in database/ relative to backend repo root.
+# seed.js (__dirname = /app/dist/scripts) resolves ../../database → /app/database.
+COPY database ./database
+
+# Startup script: auto-seeds on first deploy, then starts the server
+COPY start.sh ./
+RUN chmod +x start.sh
+
+EXPOSE 3001
+
+CMD ["./start.sh"]
