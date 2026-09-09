@@ -2,11 +2,17 @@ import { Request, Response } from 'express';
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
-import sanitizeHtml from 'sanitize-html';
 import { PDFDocument, StandardFonts, rgb } from 'pdf-lib';
 import { asyncHandler } from '../../utils/asyncHandler';
 import { ok, created, badRequest, forbidden, notFound } from '../../utils/response';
 import { buildSalaryText, canonicalizeSalaryPeriod } from '../../utils/salaryPeriod';
+import {
+  sanitizeStoredDescription,
+  sanitizeFeedDescription,
+  decodeHtmlEntities,
+  visibleTextLength,
+} from '../../utils/jobDescription';
+import { isRejectionReasonCode, REJECTION_REASON_CODES } from '../../utils/rejectionReasons';
 import { resolveIndeedApiToken } from '../../services/indeedCredentials.service';
 import { safeDisplayTimezone } from '../../utils/shiftTimezone';
 import { sendEmailForCompany } from '../../services/email.service';
@@ -280,6 +286,14 @@ export const getJobComplianceHandler = asyncHandler(async (req: Request, res: Re
     isReferenceIdDuplicate = (dupRow?.count ?? 0) > 0;
   }
 
+  // The checker must grade what Indeed actually receives, not what the row
+  // happens to hold. A posting written in Word stores Office markup whose
+  // numeric entities (&#8722; inside <m:brkBinSub/>) failed the "no raw
+  // entities" check even though the feed exports clean, valid HTML — the same
+  // class of false alarm as the City field.
+  const storedDescription = typeof job.description === 'string' ? job.description : '';
+  const feedDescription = sanitizeFeedDescription(storedDescription);
+
   const mappedJob = {
     id: job.id,
     companyId: job.company_id,
@@ -287,7 +301,11 @@ export const getJobComplianceHandler = asyncHandler(async (req: Request, res: Re
     companyName: job.company_name,
     companyEmail: job.company_email,
     title: job.title,
-    description: job.description,
+    description: feedDescription,
+    // Reported only so the UI can flag a bloated stored value as maintenance
+    // information. No check fails on it.
+    descriptionStoredLength: storedDescription.length,
+    descriptionVisibleLength: visibleTextLength(storedDescription),
     tags: job.tags || [],
     status: job.status,
     source: job.source,
@@ -456,7 +474,9 @@ export const createJobHandler = asyncHandler(async (req: Request, res: Response)
   try {
     job = await createJob(companyId, userId, {
       title: title.trim(),
-      description: typeof description === 'string' ? description : undefined,
+      // Strip Office markup before it reaches the database. The editor also
+      // cleans on paste, but this is the guard that holds for every write path.
+      description: typeof description === 'string' ? sanitizeStoredDescription(description) : undefined,
       tags: Array.isArray(tags) ? tags.filter((t): t is string => typeof t === 'string') : [],
       status: statusValue,
       storeId: typeof store_id === 'number' ? store_id : undefined,
@@ -710,7 +730,9 @@ export const updateJobHandler = asyncHandler(async (req: Request, res: Response)
     updated = await updateJob(id, effectiveCompanyId, {
       companyId: targetCompanyId,
       title:       typeof title === 'string' ? title.trim() : undefined,
-      description: typeof description === 'string' ? description : undefined,
+      // See createJobHandler: saving is the point where Word markup is dropped,
+      // so re-saving an affected posting also repairs it.
+      description: typeof description === 'string' ? sanitizeStoredDescription(description) : undefined,
       tags:        Array.isArray(tags) ? (tags as string[]) : undefined,
       status: parsedStatus,
       storeId: normalizedStoreId,
@@ -1128,6 +1150,35 @@ export const updateCandidateHandler = asyncHandler(async (req: Request, res: Res
     return;
   }
 
+  // The reason used to be an unvalidated free string, which is how one reason
+  // reached the database as five different spellings. It is now a closed list:
+  // a bare code, or "other:<note>" when the user picked "other".
+  let normalizedRejectionReason: string | undefined;
+  if (status === 'rejected' && rejection_reason !== undefined && rejection_reason !== null) {
+    if (typeof rejection_reason !== 'string') {
+      badRequest(res, 'Motivo del rifiuto non valido', 'VALIDATION_ERROR');
+      return;
+    }
+    const raw = rejection_reason.trim();
+    const separatorIndex = raw.indexOf(':');
+    const code = separatorIndex === -1 ? raw : raw.slice(0, separatorIndex);
+    const note = separatorIndex === -1 ? '' : raw.slice(separatorIndex + 1).trim();
+
+    if (!isRejectionReasonCode(code)) {
+      badRequest(
+        res,
+        `Motivo del rifiuto non valido. Valori ammessi: ${REJECTION_REASON_CODES.join(', ')}`,
+        'VALIDATION_ERROR',
+      );
+      return;
+    }
+    if (code === 'other' && !note) {
+      badRequest(res, 'Specificare il motivo quando si seleziona "Altro"', 'VALIDATION_ERROR');
+      return;
+    }
+    normalizedRejectionReason = code === 'other' ? `other:${note}` : code;
+  }
+
   const storeIds = resolveStoreIds(req.user);
   const previousStatusRow = await queryOne<{ status: CandidateStatus }>(
     storeIds && storeIds.length > 0
@@ -1158,9 +1209,9 @@ export const updateCandidateHandler = asyncHandler(async (req: Request, res: Res
   const { candidate, error } = await updateCandidateStage(
     id, 
     owner.company_id, 
-    status as CandidateStatus, 
-    storeIds, 
-    typeof rejection_reason === 'string' ? rejection_reason : undefined
+    status as CandidateStatus,
+    storeIds,
+    normalizedRejectionReason
   );
   if (error) { badRequest(res, error, 'INVALID_TRANSITION'); return; }
   if (!candidate) { notFound(res, 'Candidato non trovato'); return; }
@@ -1783,28 +1834,8 @@ function cleanFeedTitle(rawTitle: string, city: string): string {
   return out || (rawTitle ?? '').replace(/\s+/g, ' ').trim();
 }
 
-function decodeHtmlEntities(input: string): string {
-  return input
-    .replace(/&#(\d+);/g, (_m, code) => String.fromCharCode(parseInt(code, 10)))
-    .replace(/&#x([0-9a-fA-F]+);/g, (_m, code) => String.fromCharCode(parseInt(code, 16)))
-    .replace(/&nbsp;/g, ' ')
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'");
-}
-
-function sanitizeFeedDescription(input: string): string {
-  const cleaned = sanitizeHtml(input, {
-    allowedTags: ['b', 'strong', 'i', 'em', 'u', 'p', 'br', 'ul', 'ol', 'li'],
-    allowedAttributes: {},
-    parser: { lowerCaseTags: true },
-    enforceHtmlBoundary: true,
-  });
-
-  return decodeHtmlEntities(cleaned).trim();
-}
+// sanitizeFeedDescription now lives in utils/jobDescription so that the feed,
+// the stored value and the compliance checker share one allowlist.
 
 function normalizeJobType(value: string): 'fulltime' | 'parttime' | 'contract' | 'internship' {
   const normalized = value.toLowerCase();
