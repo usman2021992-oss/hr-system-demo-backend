@@ -421,3 +421,153 @@ describe('PATCH /api/employees/:id/activate', () => {
     expect(res.body.data.termination_date).toBeNull();
   });
 });
+
+// ---------------------------------------------------------------------------
+// GET /api/employees — multi-select company / store filters
+// ---------------------------------------------------------------------------
+
+describe('GET /api/employees multi-select filters', () => {
+  let milanoStoreId: number;
+  let betaStoreId: number;
+  let outsideCompanyId: number;
+
+  beforeAll(async () => {
+    const passwordHash = await testPool
+      .query<{ password_hash: string }>(`SELECT password_hash FROM users WHERE email = 'admin@acme-test.com'`)
+      .then((r) => r.rows[0].password_hash);
+
+    const { rows: [milano] } = await testPool.query<{ id: number }>(
+      `INSERT INTO stores (company_id, name, code, max_staff)
+       VALUES ($1, 'Milano Test', 'MIL-T', 10)
+       ON CONFLICT (company_id, code) DO UPDATE SET name = EXCLUDED.name
+       RETURNING id`,
+      [seeds.acmeId],
+    );
+    milanoStoreId = milano.id;
+
+    const { rows: [betaStore] } = await testPool.query<{ id: number }>(
+      `INSERT INTO stores (company_id, name, code, max_staff)
+       VALUES ($1, 'Beta Store', 'BETA-T', 10)
+       ON CONFLICT (company_id, code) DO UPDATE SET name = EXCLUDED.name
+       RETURNING id`,
+      [seeds.betaId],
+    );
+    betaStoreId = betaStore.id;
+
+    const { rows: [outside] } = await testPool.query<{ id: number }>(
+      `INSERT INTO companies (name, slug) VALUES ('Gamma Test', 'gamma-test')
+       ON CONFLICT (slug) DO UPDATE SET name = EXCLUDED.name
+       RETURNING id`,
+    );
+    outsideCompanyId = outside.id;
+
+    await testPool.query(
+      `INSERT INTO users (company_id, name, surname, email, password_hash, role, store_id, status)
+       VALUES
+         ($1, 'Milano', 'Worker', 'milano.worker@acme-test.com', $3, 'employee', $4, 'active'),
+         ($2, 'Beta', 'Worker', 'beta.worker@beta-test.com', $3, 'employee', $5, 'active'),
+         ($2, 'Beta', 'Chief', 'beta.chief@beta-test.com', $3, 'hr', NULL, 'active')
+       ON CONFLICT (email) DO UPDATE SET
+         company_id = EXCLUDED.company_id,
+         store_id = EXCLUDED.store_id,
+         status = EXCLUDED.status`,
+      [seeds.acmeId, seeds.betaId, passwordHash, milanoStoreId, betaStoreId],
+    );
+  });
+
+  it('company_ids returns employees from every selected company and no others', async () => {
+    const token = await login('admin@acme-test.com');
+    const res = await request
+      .get('/api/employees')
+      .query({ company_ids: `${seeds.acmeId},${seeds.betaId}`, limit: '100' })
+      .set('Authorization', `Bearer ${token}`);
+
+    expect(res.status).toBe(200);
+    const employees: any[] = res.body.data.employees;
+    const emails = employees.map((e) => e.email);
+    expect(emails).toContain('milano.worker@acme-test.com');
+    expect(emails).toContain('beta.worker@beta-test.com');
+    employees.forEach((e) => expect([seeds.acmeId, seeds.betaId]).toContain(e.company_id));
+  });
+
+  it('a single company id narrows the list to that company', async () => {
+    const token = await login('admin@acme-test.com');
+    const res = await request
+      .get('/api/employees')
+      .query({ company_ids: String(seeds.betaId), limit: '100' })
+      .set('Authorization', `Bearer ${token}`);
+
+    expect(res.status).toBe(200);
+    const employees: any[] = res.body.data.employees;
+    expect(employees.length).toBeGreaterThan(0);
+    employees.forEach((e) => expect(e.company_id).toBe(seeds.betaId));
+  });
+
+  it('roles other than employee survive the company filter', async () => {
+    const token = await login('admin@acme-test.com');
+    const res = await request
+      .get('/api/employees')
+      .query({ company_ids: String(seeds.betaId), limit: '100' })
+      .set('Authorization', `Bearer ${token}`);
+
+    const roles: string[] = res.body.data.employees.map((e: any) => e.role);
+    expect(roles).toContain('hr');
+  });
+
+  it('store_ids filters across companies and keeps the total honest', async () => {
+    const token = await login('admin@acme-test.com');
+    const res = await request
+      .get('/api/employees')
+      .query({ store_ids: `${milanoStoreId},${betaStoreId}`, limit: '100' })
+      .set('Authorization', `Bearer ${token}`);
+
+    expect(res.status).toBe(200);
+    const employees: any[] = res.body.data.employees;
+    const emails = employees.map((e) => e.email);
+    expect(emails).toContain('milano.worker@acme-test.com');
+    expect(emails).toContain('beta.worker@beta-test.com');
+    expect(emails).not.toContain('employee1@acme-test.com');
+    employees.forEach((e) => expect([milanoStoreId, betaStoreId]).toContain(e.store_id));
+    expect(res.body.data.total).toBe(employees.length);
+  });
+
+  it('paging a multi-company filter reports the filtered total, not the page size', async () => {
+    const token = await login('admin@acme-test.com');
+    const res = await request
+      .get('/api/employees')
+      .query({ company_ids: `${seeds.acmeId},${seeds.betaId}`, page: '1', limit: '1' })
+      .set('Authorization', `Bearer ${token}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.employees.length).toBe(1);
+    expect(res.body.data.total).toBeGreaterThan(1);
+    expect(res.body.data.pages).toBeGreaterThan(1);
+  });
+
+  it('rejects a company the caller may not see', async () => {
+    const token = await login('admin@acme-test.com');
+    const res = await request
+      .get('/api/employees')
+      .query({ company_ids: `${seeds.acmeId},${outsideCompanyId}` })
+      .set('Authorization', `Bearer ${token}`);
+
+    expect(res.status).toBe(403);
+    expect(res.body.code).toBe('COMPANY_MISMATCH');
+  });
+
+  it('a store manager cannot widen their scope with company_ids', async () => {
+    const token = await login('manager.roma@acme-test.com');
+    const res = await request
+      .get('/api/employees')
+      .query({ company_ids: String(seeds.acmeId), limit: '100' })
+      .set('Authorization', `Bearer ${token}`);
+
+    expect(res.status).toBe(200);
+    const employees: any[] = res.body.data.employees;
+    const emails: string[] = employees.map((e) => e.email);
+    expect(emails).not.toContain('admin@acme-test.com');
+    expect(emails).not.toContain('milano.worker@acme-test.com');
+    expect(emails).not.toContain('beta.worker@beta-test.com');
+    employees.forEach((e) => expect(e.store_id).toBe(seeds.romaStoreId));
+  });
+});

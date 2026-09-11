@@ -195,6 +195,16 @@ async function resolveScopeCompanyIdsForSubject(
   return [subjectCompanyId];
 }
 
+/** Parses a comma-separated id list ("1,3,7") into unique positive integers. */
+function parseIdList(raw: string | undefined): number[] {
+  if (!raw) return [];
+  const ids = raw
+    .split(',')
+    .map((value) => parseInt(value.trim(), 10))
+    .filter((value) => Number.isInteger(value) && value > 0);
+  return Array.from(new Set(ids));
+}
+
 // GET /api/employees — list with filters, no sensitive fields
 export const listEmployees = asyncHandler(async (req: Request, res: Response) => {
   const { companyId, role, userId, storeId } = req.user!;
@@ -207,12 +217,14 @@ export const listEmployees = asyncHandler(async (req: Request, res: Response) =>
   const {
     search,
     store_id,
+    store_ids,
     department,
     status: statusFilter,
     role: roleFilter,
     exclude_admins,
     include_store_terminals,
     target_company_id,
+    company_ids,
     page = '1',
     limit = '20',
     for_shift_planning,
@@ -222,12 +234,26 @@ export const listEmployees = asyncHandler(async (req: Request, res: Response) =>
   const allowedCompanyIds = await resolveAllowedCompanyIds(req.user!);
   const hasCrossCompanyAccess = allowedCompanyIds.length > 1;
 
-  const targetCompanyId = target_company_id ? parseInt(target_company_id, 10) : null;
-  if (targetCompanyId !== null && !allowedCompanyIds.includes(targetCompanyId)) {
+  // Multi-select filters arrive as comma-separated ids and are applied in SQL, so
+  // paging and totals stay correct — the client must never trim an already-paged page.
+  const requestedCompanyIds = parseIdList(company_ids);
+  const requestedStoreIds = parseIdList(store_ids);
+
+  const explicitTargetCompanyId = target_company_id ? parseInt(target_company_id, 10) : null;
+  const deniedCompanyIds = [
+    ...(explicitTargetCompanyId !== null ? [explicitTargetCompanyId] : []),
+    ...requestedCompanyIds,
+  ].filter((id) => !allowedCompanyIds.includes(id));
+  if (deniedCompanyIds.length > 0) {
     return res.status(403).json({ success: false, error: 'Accesso negato: azienda non valida', code: 'COMPANY_MISMATCH' });
   }
 
-  // Cross-company with no target: query all allowed companies
+  // One selected company behaves exactly like the legacy target_company_id.
+  const targetCompanyId =
+    explicitTargetCompanyId ?? (requestedCompanyIds.length === 1 ? requestedCompanyIds[0] : null);
+
+  // Cross-company with no single target: start from every allowed company and
+  // narrow below when a subset of companies was selected.
   const crossCompany = hasCrossCompanyAccess && !targetCompanyId;
 
   const canSeeSensitive = ['admin', 'hr', 'area_manager'].includes(role);
@@ -301,7 +327,18 @@ export const listEmployees = asyncHandler(async (req: Request, res: Response) =>
     extraParams.push(`%${escapedSearch}%`);
     paramIdx++;
   }
-  if (store_id) {
+  // Company multi-select: narrows the scope that was already resolved above, so it
+  // can never widen a caller's access.
+  if (requestedCompanyIds.length > 1) {
+    extraWhere += ` AND u.company_id = ANY($${paramIdx})`;
+    extraParams.push(requestedCompanyIds);
+    paramIdx++;
+  }
+  if (requestedStoreIds.length > 0) {
+    extraWhere += ` AND u.store_id = ANY($${paramIdx})`;
+    extraParams.push(requestedStoreIds);
+    paramIdx++;
+  } else if (store_id) {
     extraWhere += ` AND u.store_id = $${paramIdx}`;
     extraParams.push(parseInt(store_id, 10));
     paramIdx++;
