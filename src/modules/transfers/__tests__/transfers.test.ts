@@ -116,3 +116,125 @@ describe('Transfers + shifts integration', () => {
     expect(res.body.code).toBe('TRANSFER_OVERLAP');
   });
 });
+
+// ---------------------------------------------------------------------------
+// Company filter + who may be transferred
+// ---------------------------------------------------------------------------
+
+describe('GET /api/transfers company filter', () => {
+  let outsideCompanyId: number;
+
+  beforeAll(async () => {
+    const { rows: [outside] } = await testPool.query<{ id: number }>(
+      `INSERT INTO companies (name, slug) VALUES ('Delta Test', 'delta-test')
+       ON CONFLICT (slug) DO UPDATE SET name = EXCLUDED.name
+       RETURNING id`,
+    );
+    outsideCompanyId = outside.id;
+  });
+
+  it('returns only the transfers of the requested company', async () => {
+    const token = await login('admin@acme-test.com');
+    const res = await request
+      .get('/api/transfers')
+      .query({ company_id: String(seeds.acmeId) })
+      .set('Authorization', `Bearer ${token}`);
+
+    expect(res.status).toBe(200);
+    const transfers: any[] = res.body.data.transfers;
+    expect(transfers.length).toBeGreaterThan(0);
+    transfers.forEach((tr) => expect(tr.company_id).toBe(seeds.acmeId));
+  });
+
+  it('returns nothing for a company in scope that has no transfers', async () => {
+    const token = await login('admin@acme-test.com');
+    const res = await request
+      .get('/api/transfers')
+      .query({ company_id: String(seeds.betaId) })
+      .set('Authorization', `Bearer ${token}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.transfers).toEqual([]);
+  });
+
+  it('rejects a company the caller may not see', async () => {
+    const token = await login('admin@acme-test.com');
+    const res = await request
+      .get('/api/transfers')
+      .query({ company_id: String(outsideCompanyId) })
+      .set('Authorization', `Bearer ${token}`);
+
+    expect(res.status).toBe(403);
+    expect(res.body.code).toBe('COMPANY_MISMATCH');
+  });
+});
+
+describe('POST /api/transfers subject roles', () => {
+  it('transfers a store manager, not only plain employees', async () => {
+    const token = await login('admin@acme-test.com');
+    const res = await request
+      .post('/api/transfers')
+      .set('Authorization', `Bearer ${token}`)
+      .send({
+        user_id: seeds.romaManagerId,
+        origin_store_id: seeds.romaStoreId,
+        target_store_id: secondStoreId,
+        start_date: '2030-03-01',
+        end_date: '2030-03-05',
+        reason: 'Copertura direzione negozio',
+      });
+
+    expect(res.status).toBe(201);
+    expect(res.body.data.transfer.user_id).toBe(seeds.romaManagerId);
+  });
+
+  it('transfers an HR user when an origin store is given explicitly', async () => {
+    const token = await login('admin@acme-test.com');
+    const res = await request
+      .post('/api/transfers')
+      .set('Authorization', `Bearer ${token}`)
+      .send({
+        user_id: seeds.hrId,
+        origin_store_id: seeds.romaStoreId,
+        target_store_id: secondStoreId,
+        start_date: '2030-04-01',
+        end_date: '2030-04-02',
+        reason: 'Affiancamento',
+      });
+
+    expect(res.status).toBe(201);
+    expect(res.body.data.transfer.user_id).toBe(seeds.hrId);
+  });
+
+  it('refuses to transfer an admin', async () => {
+    const token = await login('admin@acme-test.com');
+    const res = await request
+      .post('/api/transfers')
+      .set('Authorization', `Bearer ${token}`)
+      .send({
+        user_id: seeds.adminId,
+        origin_store_id: seeds.romaStoreId,
+        target_store_id: secondStoreId,
+        start_date: '2030-05-01',
+        end_date: '2030-05-02',
+      });
+
+    expect(res.status).toBe(404);
+  });
+
+  it('refuses to transfer a store terminal', async () => {
+    const token = await login('admin@acme-test.com');
+    const res = await request
+      .post('/api/transfers')
+      .set('Authorization', `Bearer ${token}`)
+      .send({
+        user_id: seeds.terminalId,
+        origin_store_id: seeds.romaStoreId,
+        target_store_id: secondStoreId,
+        start_date: '2030-06-01',
+        end_date: '2030-06-02',
+      });
+
+    expect(res.status).toBe(404);
+  });
+});
