@@ -52,6 +52,18 @@ interface ShiftWarningCounts {
   origin_store_shifts: number;
 }
 
+/**
+ * Roles a transfer may be created for. A transfer moves staff between stores, so
+ * it covers everyone who actually works one — admins (including super admins) are
+ * not store staff, and a store terminal is a device account, not a person.
+ */
+const TRANSFERABLE_SUBJECT_ROLES: UserRole[] = ['employee', 'store_manager', 'area_manager', 'hr'];
+
+function isTransferableSubject(subject: { role: string; is_super_admin?: boolean | null }): boolean {
+  if (subject.is_super_admin) return false;
+  return TRANSFERABLE_SUBJECT_ROLES.includes(subject.role as UserRole);
+}
+
 const TRANSFER_SELECT = `
   tsa.id,
   tsa.company_id,
@@ -306,7 +318,7 @@ async function canReadTransfer(
 
 export const listTransfers = asyncHandler(async (req: Request, res: Response) => {
   const { role, userId, storeId } = req.user!;
-  const { status, user_id, store_id, date_from, date_to } = req.query as Record<string, string>;
+  const { status, user_id, store_id, company_id, date_from, date_to } = req.query as Record<string, string>;
 
   const allowedCompanyIds = await resolveAllowedCompanyIds(req.user!);
   const scope = await buildTransferReadScope(role, allowedCompanyIds, userId, storeId);
@@ -314,6 +326,22 @@ export const listTransfers = asyncHandler(async (req: Request, res: Response) =>
   let extraWhere = '';
   const extraParams: any[] = [];
   let idx = scope.params.length + 1;
+
+  // Narrows the scope already resolved for this caller, so it can never widen access.
+  if (company_id) {
+    const parsed = parseInt(company_id, 10);
+    if (Number.isNaN(parsed)) {
+      badRequest(res, 'company_id non valido', 'VALIDATION_ERROR');
+      return;
+    }
+    if (!allowedCompanyIds.includes(parsed)) {
+      res.status(403).json({ success: false, error: 'Accesso negato: azienda non valida', code: 'COMPANY_MISMATCH' });
+      return;
+    }
+    extraWhere += ` AND tsa.company_id = $${idx}`;
+    extraParams.push(parsed);
+    idx++;
+  }
 
   if (status) {
     extraWhere += ` AND tsa.status = $${idx}`;
@@ -503,15 +531,16 @@ export const createTransfer = asyncHandler(async (req: Request, res: Response) =
     store_id: number | null;
     role: string;
     status: string;
+    is_super_admin: boolean;
   }>(
-    `SELECT id, company_id, store_id, role, status
+    `SELECT id, company_id, store_id, role, status, is_super_admin
      FROM users
      WHERE id = $1
        AND company_id = ANY($2)`,
     [body.user_id, allowedCompanyIds],
   );
 
-  if (!employee || employee.role !== 'employee' || employee.status !== 'active') {
+  if (!employee || !isTransferableSubject(employee) || employee.status !== 'active') {
     notFound(res, 'Dipendente non trovato');
     return;
   }
@@ -1252,15 +1281,16 @@ export const getEmployeeUnifiedSchedule = asyncHandler(async (req: Request, res:
     surname: string;
     role: string;
     avatar_filename: string | null;
+    is_super_admin: boolean;
   }>(
-    `SELECT id, company_id, store_id, name, surname, role, avatar_filename
+    `SELECT id, company_id, store_id, name, surname, role, avatar_filename, is_super_admin
      FROM users
      WHERE id = $1
        AND company_id = ANY($2)`,
     [employeeId, allowedCompanyIds],
   );
 
-  if (!employee || employee.role !== 'employee') {
+  if (!employee || !isTransferableSubject(employee)) {
     notFound(res, 'Dipendente non trovato');
     return;
   }
