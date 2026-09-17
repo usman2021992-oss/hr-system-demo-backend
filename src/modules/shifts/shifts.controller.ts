@@ -12,7 +12,7 @@ import { sendNotification } from '../notifications/notifications.service';
 import { sendShiftCreatedAutomation } from '../automations/shiftNotification';
 import { t } from '../../utils/i18n';
 import { PDFDocument, rgb, StandardFonts } from 'pdf-lib';
-import { APPROVED_LEAVE_STATUS_SQL } from '../../utils/leaveCoverage';
+import { APPROVED_LEAVE_STATUS_SQL, APPROVED_LEAVE_STATUSES } from '../../utils/leaveCoverage';
 
 /**
  * Approved leave covering a date the caller is about to schedule.
@@ -1603,20 +1603,55 @@ export const deleteTemplate = asyncHandler(async (req: Request, res: Response) =
   ok(res, template, 'Template eliminato');
 });
 
+/**
+ * Statuses that are never granted leave, whatever the approval chain looks like.
+ * Mirrors leave_status_is_terminal_approval() from migration 135, inlined so the
+ * export does not depend on that function existing in the target database.
+ */
+const NOT_GRANTED_LEAVE_STATUSES = [
+  'pending',
+  'rejected',
+  'cancelled',
+  'store manager rejected',
+  'area manager rejected',
+  'HR rejected',
+] as const;
+
 // ---------------------------------------------------------------------------
 // GET /api/shifts/export  ?store_id&week  → CSV download
 // ---------------------------------------------------------------------------
 export const exportShifts = asyncHandler(async (req: Request, res: Response) => {
+  const { role, storeId: callerStoreId } = req.user!;
   const allowedCompanyIds = await resolveAllowedCompanyIds(req.user!);
   const { store_id, week } = req.query as Record<string, string>;
+
+  let storeFilterId: number | null = null;
+  if (store_id) {
+    storeFilterId = parseInt(store_id, 10);
+    if (Number.isNaN(storeFilterId)) {
+      badRequest(res, 'store_id non valido', 'VALIDATION_ERROR');
+      return;
+    }
+  }
+
+  // A store manager sees only their own store in the list (buildShiftScope), so the
+  // export may not hand them more: no other store's calendar, and no company-wide one.
+  // The document carries staff absences, which makes this a privacy boundary too.
+  if (role === 'store_manager') {
+    if (!callerStoreId || (storeFilterId !== null && storeFilterId !== callerStoreId)) {
+      forbidden(res, 'Accesso negato');
+      return;
+    }
+    storeFilterId = callerStoreId;
+  }
 
   const params: any[] = [allowedCompanyIds];
   let extraWhere = '';
   let idx = 2;
 
-  if (store_id) {
+  if (storeFilterId !== null) {
     extraWhere += ` AND s.store_id = $${idx}`;
-    params.push(parseInt(store_id, 10));
+    params.push(storeFilterId);
     idx++;
   }
 
@@ -1688,27 +1723,21 @@ export const exportShifts = asyncHandler(async (req: Request, res: Response) => 
       dates.push(formatDateUTC(cur));
     }
 
-    // Query leave requests overlapping with this week
-    const leaves = await query<Record<string, any>>(
-      `SELECT lr.id, lr.user_id, lr.leave_type, lr.status,
-              TO_CHAR(lr.start_date, 'YYYY-MM-DD') AS start_date,
-              TO_CHAR(lr.end_date, 'YYYY-MM-DD') AS end_date,
-              u.name AS user_name, u.surname AS user_surname, u.unique_id
-       FROM leave_requests lr
-       JOIN users u ON u.id = lr.user_id
-       WHERE lr.company_id = ANY($1)
-         AND lr.status != 'rejected'
-         AND lr.start_date <= (DATE_TRUNC('week', TO_DATE($2, 'IYYY-IW'))::DATE + INTERVAL '6 days')::DATE
-         AND lr.end_date >= DATE_TRUNC('week', TO_DATE($2, 'IYYY-IW'))::DATE`,
-      [allowedCompanyIds, parseIsoWeek(week)],
-    );
+    // The header names the store from the store itself, not from its first shift:
+    // a week can now print with only leave rows for the store's own staff.
+    const storeName = storeFilterId !== null
+      ? (await queryOne<{ name: string }>(
+          `SELECT name FROM stores WHERE id = $1 AND company_id = ANY($2)`,
+          [storeFilterId, allowedCompanyIds],
+        ))?.name ?? shifts[0]?.store_name ?? ''
+      : '';
 
     // Query temporary store transfers overlapping with this week
     let transferStoreWhere = '';
     const transferParams: any[] = [allowedCompanyIds, parseIsoWeek(week)];
-    if (store_id) {
+    if (storeFilterId !== null) {
       transferStoreWhere = ` AND (tsa.origin_store_id = $3 OR tsa.target_store_id = $3)`;
-      transferParams.push(parseInt(store_id, 10));
+      transferParams.push(storeFilterId);
     }
     const transfers = await query<Record<string, any>>(
       `SELECT tsa.id, tsa.user_id, tsa.status,
@@ -1726,6 +1755,47 @@ export const exportShifts = asyncHandler(async (req: Request, res: Response) => 
          AND tsa.start_date <= (DATE_TRUNC('week', TO_DATE($2, 'IYYY-IW'))::DATE + INTERVAL '6 days')::DATE
          AND tsa.end_date >= DATE_TRUNC('week', TO_DATE($2, 'IYYY-IW'))::DATE${transferStoreWhere}`,
       transferParams,
+    );
+
+    // Leave overlapping this week. Two rules, both of which the query used to miss:
+    //  - Only granted leave. Excluding just 'rejected' let pending, cancelled and the
+    //    legacy "... rejected" spellings through, and all of them printed as "Ferie".
+    //    Granted means what the database trigger enforces (migration 135): no further
+    //    approver, and not pending, refused or withdrawn. That holds whichever role
+    //    ends the company's chain; the named approved spellings are kept as a floor.
+    //  - On a store's calendar, only leave of that store's own staff, or of someone
+    //    already on it through a shift or a transfer. Without this every store's PDF
+    //    carried the whole company's absences as empty 0-hour rows.
+    const rosterUserIds = Array.from(new Set<number>([
+      ...shifts.map((s) => s.user_id).filter((id): id is number => id != null),
+      ...transfers.map((tr) => tr.user_id as number),
+    ]));
+    let leaveStoreWhere = '';
+    const leaveParams: any[] = [
+      allowedCompanyIds,
+      parseIsoWeek(week),
+      [...APPROVED_LEAVE_STATUSES],
+      [...NOT_GRANTED_LEAVE_STATUSES],
+    ];
+    if (storeFilterId !== null) {
+      leaveStoreWhere = ` AND (u.store_id = $5 OR lr.user_id = ANY($6::int[]))`;
+      leaveParams.push(storeFilterId, rosterUserIds);
+    }
+    const leaves = await query<Record<string, any>>(
+      `SELECT lr.id, lr.user_id, lr.leave_type, lr.status,
+              TO_CHAR(lr.start_date, 'YYYY-MM-DD') AS start_date,
+              TO_CHAR(lr.end_date, 'YYYY-MM-DD') AS end_date,
+              u.name AS user_name, u.surname AS user_surname, u.unique_id
+       FROM leave_requests lr
+       JOIN users u ON u.id = lr.user_id
+       WHERE lr.company_id = ANY($1)
+         AND (
+           lr.status = ANY($3::text[])
+           OR (lr.current_approver_role IS NULL AND lr.status <> ALL($4::text[]))
+         )
+         AND lr.start_date <= (DATE_TRUNC('week', TO_DATE($2, 'IYYY-IW'))::DATE + INTERVAL '6 days')::DATE
+         AND lr.end_date >= DATE_TRUNC('week', TO_DATE($2, 'IYYY-IW'))::DATE${leaveStoreWhere}`,
+      leaveParams,
     );
 
     // Grouping
@@ -1834,9 +1904,8 @@ export const exportShifts = asyncHandler(async (req: Request, res: Response) => 
       const uLeaves = userLeavesMap.get(u.id) || [];
       const activeLeave = uLeaves.find((lr: any) => isDateWithinRange(dateStr, lr.start_date, lr.end_date));
       if (activeLeave) {
-        const label = activeLeave.leave_type === 'vacation' ? 'Ferie' : 'Permesso';
-        const statusText = activeLeave.status === 'pending' ? '(In attesa)' : '';
-        return [label, statusText].filter(Boolean);
+        // Only approved leave is loaded, so there is no pending state to print.
+        return [activeLeave.leave_type === 'vacation' ? 'Ferie' : 'Permesso'];
       }
 
       // Check transfers
@@ -1905,8 +1974,8 @@ export const exportShifts = asyncHandler(async (req: Request, res: Response) => 
       p.drawText('CALENDARIO SETTIMANALE TURNI', { x: startX + 20, y: curY - 25, size: 14, font: fontBold, color: rgb(1, 1, 1) });
 
       let storeSubtitle = '';
-      if (shifts.length > 0 && store_id) {
-        storeSubtitle = ` | Negozio: ${shifts[0].store_name}`;
+      if (storeFilterId !== null && storeName) {
+        storeSubtitle = ` | Negozio: ${storeName}`;
       }
       p.drawText(`Settimana: ${week}${storeSubtitle} | Generato il: ${new Date().toLocaleString('it-IT')}`, { x: startX + 20, y: curY - 45, size: 9, font, color: rgb(0.9, 0.9, 0.9) });
 
