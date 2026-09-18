@@ -29,9 +29,11 @@ const MIME_TO_EXT: Record<string, string> = {
 const storage = multer.diskStorage({
   destination: (_req, _file, cb) => cb(null, UPLOAD_DIR),
   filename: (req, file, cb) => {
-    const userId = req.params.id;
+    const userId = parseInt(req.params.id, 10);
     const ext = MIME_TO_EXT[file.mimetype] ?? '.jpg';
-    cb(null, `${userId}${ext}`);
+    // A fresh name per upload, so browsers never serve the previous photo from
+    // cache. The serving routes read the owner from the leading "<userId>".
+    cb(null, `${Number.isFinite(userId) ? userId : 'x'}-${Date.now()}${ext}`);
   },
 });
 
@@ -82,8 +84,8 @@ export const uploadAvatar = asyncHandler(async (req: Request, res: Response) => 
   const allowedCompanyIds = await resolveAllowedCompanyIds(req.user!);
 
   // Verify employee exists in one of the caller's allowed companies
-  const emp = await queryOne<{ id: number }>(
-    `SELECT id FROM users WHERE id = $1 AND company_id = ANY($2)`,
+  const emp = await queryOne<{ id: number; avatar_filename: string | null }>(
+    `SELECT id, avatar_filename FROM users WHERE id = $1 AND company_id = ANY($2)`,
     [empId, allowedCompanyIds],
   );
   if (!emp) { cleanupUploadedFile(req); notFound(res, 'Dipendente non trovato'); return; }
@@ -99,6 +101,11 @@ export const uploadAvatar = asyncHandler(async (req: Request, res: Response) => 
     `UPDATE users SET avatar_filename = $1, updated_at = NOW() WHERE id = $2`,
     [filename, empId],
   );
+
+  // Each upload has its own name now, so the previous file would be orphaned.
+  if (emp.avatar_filename && emp.avatar_filename !== filename && /^[a-zA-Z0-9._-]+$/.test(emp.avatar_filename)) {
+    try { fs.unlinkSync(path.join(UPLOAD_DIR, emp.avatar_filename)); } catch { /* already gone */ }
+  }
 
   ok(res, { avatarUrl: `/uploads/avatars/${filename}` }, 'Avatar aggiornato');
 });
