@@ -110,6 +110,86 @@ describe('POST /api/auth/logout', () => {
     expect(res.status).toBe(200);
     expect(res.body.success).toBe(true);
   });
+
+  it('revokes the refresh token, even once the access token has expired', async () => {
+    const loginRes = await request.post('/api/auth/login').send({ email: 'admin@acme-test.com', password: 'password123' });
+    const refreshToken = loginRes.body.data.refresh_token;
+
+    const res = await request.post('/api/auth/logout')
+      .set('Authorization', 'Bearer expired.or.garbage')
+      .send({ refresh_token: refreshToken });
+    expect(res.status).toBe(200);
+
+    const after = await request.post('/api/auth/refresh').send({ refresh_token: refreshToken });
+    expect(after.status).toBe(401);
+  });
+});
+
+describe('POST /api/auth/refresh', () => {
+  it('login hands out a refresh token, stored only as a hash', async () => {
+    const loginRes = await request.post('/api/auth/login').send({ email: 'admin@acme-test.com', password: 'password123' });
+    const refreshToken = loginRes.body.data.refresh_token as string;
+    expect(typeof refreshToken).toBe('string');
+    expect(refreshToken.length).toBeGreaterThan(40);
+
+    const { rows } = await testPool.query(`SELECT token_hash FROM auth_refresh_tokens WHERE token_hash = $1`, [refreshToken]);
+    expect(rows).toHaveLength(0);
+  });
+
+  it('trades a live refresh token for a new, working access token', async () => {
+    const loginRes = await request.post('/api/auth/login').send({ email: 'admin@acme-test.com', password: 'password123' });
+    const refreshToken = loginRes.body.data.refresh_token;
+
+    const res = await request.post('/api/auth/refresh').send({ refresh_token: refreshToken });
+    expect(res.status).toBe(200);
+    expect(res.body.data.refresh_token).toBe(refreshToken);
+
+    const me = await request.get('/api/auth/me').set('Authorization', `Bearer ${res.body.data.token}`);
+    expect(me.status).toBe(200);
+    expect(me.body.data.email).toBe('admin@acme-test.com');
+  });
+
+  it('rejects an unknown token', async () => {
+    const res = await request.post('/api/auth/refresh').send({ refresh_token: 'not-a-real-token' });
+    expect(res.status).toBe(401);
+    expect(res.body.code).toBe('INVALID_REFRESH_TOKEN');
+  });
+
+  it('rejects a token past its idle expiry', async () => {
+    const loginRes = await request.post('/api/auth/login').send({ email: 'admin@acme-test.com', password: 'password123' });
+    await testPool.query(`UPDATE auth_refresh_tokens SET expires_at = NOW() - INTERVAL '1 minute'`);
+    const res = await request.post('/api/auth/refresh').send({ refresh_token: loginRes.body.data.refresh_token });
+    expect(res.status).toBe(401);
+  });
+
+  it('refuses a deactivated user', async () => {
+    const loginRes = await request.post('/api/auth/login').send({ email: 'employee1@acme-test.com', password: 'password123' });
+    await testPool.query(`UPDATE users SET status = 'inactive' WHERE email = 'employee1@acme-test.com'`);
+    try {
+      const res = await request.post('/api/auth/refresh').send({ refresh_token: loginRes.body.data.refresh_token });
+      expect(res.status).toBe(401);
+    } finally {
+      await testPool.query(`UPDATE users SET status = 'active' WHERE email = 'employee1@acme-test.com'`);
+    }
+  });
+
+  it('remember me gives a longer-lived refresh token, but the access token stays standard', async () => {
+    const short = await request.post('/api/auth/login').send({ email: 'admin@acme-test.com', password: 'password123' });
+    const long = await request.post('/api/auth/login').send({ email: 'admin@acme-test.com', password: 'password123', remember_me: true });
+    const { rows } = await testPool.query<{ remember_me: boolean; idle_hours: number }>(
+      `SELECT remember_me, EXTRACT(EPOCH FROM (expires_at - created_at)) / 3600 AS idle_hours
+       FROM auth_refresh_tokens ORDER BY id DESC LIMIT 2`,
+    );
+    expect(rows[0].remember_me).toBe(true);
+    expect(Number(rows[0].idle_hours)).toBeGreaterThan(24 * 7);
+    expect(rows[1].remember_me).toBe(false);
+    expect(Math.round(Number(rows[1].idle_hours))).toBe(24);
+
+    const claims = (t: string) => JSON.parse(Buffer.from(t.split('.')[1], 'base64url').toString());
+    const shortLife = claims(short.body.data.token).exp - claims(short.body.data.token).iat;
+    const longLife = claims(long.body.data.token).exp - claims(long.body.data.token).iat;
+    expect(longLife).toBe(shortLife);
+  });
 });
 
 describe('PUT /api/auth/password', () => {
@@ -129,6 +209,23 @@ describe('PUT /api/auth/password', () => {
     const newToken = res.body.data.token;
     await request.put('/api/auth/password')
       .set('Authorization', `Bearer ${newToken}`)
+      .send({ current_password: 'newpassword456', new_password: 'password123' });
+  });
+
+  it('ends the other sessions but keeps the one making the change', async () => {
+    const other = await request.post('/api/auth/login').send({ email: 'employee1@acme-test.com', password: 'password123' });
+    const mine = await request.post('/api/auth/login').send({ email: 'employee1@acme-test.com', password: 'password123' });
+
+    const res = await request.put('/api/auth/password')
+      .set('Authorization', `Bearer ${mine.body.data.token}`)
+      .send({ current_password: 'password123', new_password: 'newpassword456', refresh_token: mine.body.data.refresh_token });
+    expect(res.status).toBe(200);
+
+    expect((await request.post('/api/auth/refresh').send({ refresh_token: other.body.data.refresh_token })).status).toBe(401);
+    expect((await request.post('/api/auth/refresh').send({ refresh_token: mine.body.data.refresh_token })).status).toBe(200);
+
+    await request.put('/api/auth/password')
+      .set('Authorization', `Bearer ${res.body.data.token}`)
       .send({ current_password: 'newpassword456', new_password: 'password123' });
   });
 

@@ -4,6 +4,13 @@ import { query, queryOne } from '../../config/database';
 import { signAuthToken, JwtPayload, UserRole } from '../../config/jwt';
 import { ok, badRequest, unauthorized, serverError, forbidden } from '../../utils/response';
 import { asyncHandler } from '../../utils/asyncHandler';
+import {
+  issueRefreshToken,
+  findLiveRefreshToken,
+  touchRefreshToken,
+  revokeRefreshToken,
+  revokeAllRefreshTokensForUser,
+} from './refreshTokens';
 
 interface UserRow {
   id: number;
@@ -42,6 +49,52 @@ async function isRateLimited(email: string, ip: string): Promise<boolean> {
   return emailCount >= 5 || ipCount >= 10;
 }
 
+type CompanyAccessBlock = { code: 'COMPANY_ACCESS_NOT_ACTIVE' | 'COMPANY_ACCESS_EXPIRED'; message: string };
+
+/** The company's access window, as enforced at login. Shared by /login and /refresh. */
+async function checkCompanyAccessWindow(
+  user: Pick<UserRow, 'is_super_admin' | 'company_id'>,
+): Promise<CompanyAccessBlock | null> {
+  if (user.is_super_admin === true || user.company_id === null) return null;
+  const comp = await queryOne<{ access_valid_from: string | null; access_valid_to: string | null }>(
+    `SELECT access_valid_from, access_valid_to FROM companies WHERE id = $1`,
+    [user.company_id]
+  );
+  if (!comp) return null;
+  const now = new Date();
+  if (comp.access_valid_from && now < new Date(comp.access_valid_from)) {
+    return { code: 'COMPANY_ACCESS_NOT_ACTIVE', message: 'Accesso non ancora attivo per questa azienda.' };
+  }
+  if (comp.access_valid_to) {
+    const toDate = new Date(comp.access_valid_to);
+    toDate.setHours(23, 59, 59, 999);
+    if (now > toDate) {
+      return { code: 'COMPANY_ACCESS_EXPIRED', message: 'Il periodo di accesso per questa azienda è scaduto.' };
+    }
+  }
+  return null;
+}
+
+type TokenUser = Pick<UserRow, 'id' | 'email' | 'role' | 'company_id' | 'store_id' | 'supervisor_id' | 'is_super_admin'>;
+
+function signTokenForUser(user: TokenUser): string {
+  // The access token keeps its normal lifetime whatever "remember me" says;
+  // remembering the login is the refresh token's job.
+  return signAuthToken({
+    userId: user.id,
+    email: user.email,
+    role: user.role,
+    companyId: user.company_id,
+    storeId: user.store_id,
+    supervisorId: user.supervisor_id,
+    is_super_admin: user.is_super_admin,
+  });
+}
+
+function clientIp(req: Request): string {
+  return (req.headers['x-forwarded-for'] as string) || req.socket.remoteAddress || 'unknown';
+}
+
 async function recordLoginAttempt(email: string, ip: string): Promise<void> {
   await query(
     `INSERT INTO login_attempts (email, ip_address) VALUES ($1, $2)`,
@@ -52,7 +105,7 @@ async function recordLoginAttempt(email: string, ip: string): Promise<void> {
 export const login = asyncHandler(async (req: Request, res: Response) => {
   const { email, password, remember_me, rememberMe } = req.body as { email: string; password: string; remember_me?: boolean; rememberMe?: boolean };
   const isRememberMe = remember_me ?? rememberMe;
-  const ip = (req.headers['x-forwarded-for'] as string) || req.socket.remoteAddress || 'unknown';
+  const ip = clientIp(req);
 
   // Rate limiting check
   if (await isRateLimited(email, ip)) {
@@ -85,28 +138,11 @@ export const login = asyncHandler(async (req: Request, res: Response) => {
   }
 
   // Check company access validity for non-super-admins
-  if (user.is_super_admin !== true && user.company_id !== null) {
-    const comp = await queryOne<{ access_valid_from: string | null; access_valid_to: string | null }>(
-      `SELECT access_valid_from, access_valid_to FROM companies WHERE id = $1`,
-      [user.company_id]
-    );
-    if (comp) {
-      const now = new Date();
-      if (comp.access_valid_from && now < new Date(comp.access_valid_from)) {
-        await recordLoginAttempt(email, ip);
-        forbidden(res, 'Accesso non ancora attivo per questa azienda.', 'COMPANY_ACCESS_NOT_ACTIVE');
-        return;
-      }
-      if (comp.access_valid_to) {
-        const toDate = new Date(comp.access_valid_to);
-        toDate.setHours(23, 59, 59, 999);
-        if (now > toDate) {
-          await recordLoginAttempt(email, ip);
-          forbidden(res, 'Il periodo di accesso per questa azienda è scaduto.', 'COMPANY_ACCESS_EXPIRED');
-          return;
-        }
-      }
-    }
+  const companyBlock = await checkCompanyAccessWindow(user);
+  if (companyBlock) {
+    await recordLoginAttempt(email, ip);
+    forbidden(res, companyBlock.message, companyBlock.code);
+    return;
   }
 
   // Log successful login to audit_logs
@@ -119,21 +155,15 @@ export const login = asyncHandler(async (req: Request, res: Response) => {
   // Clean up this user's login attempt history on successful login (M14)
   await query(`DELETE FROM login_attempts WHERE email = $1`, [email]);
 
-  const token = signAuthToken(
-    {
-      userId: user.id,
-      email: user.email,
-      role: user.role,
-      companyId: user.company_id,
-      storeId: user.store_id,
-      supervisorId: user.supervisor_id,
-      is_super_admin: user.is_super_admin,
-    },
-    isRememberMe === true
-  );
+  const token = signTokenForUser(user);
+  const refreshToken = await issueRefreshToken(user.id, isRememberMe === true, {
+    userAgent: req.headers['user-agent'] ?? null,
+    ip,
+  });
 
   ok(res, {
     token,
+    refresh_token: refreshToken,
     user: {
       id: user.id,
       name: user.name,
@@ -155,12 +185,50 @@ export const login = asyncHandler(async (req: Request, res: Response) => {
   });
 });
 
+/**
+ * POST /api/auth/refresh  { refresh_token }
+ * Trades a live refresh token for a new access token, rebuilt from the current
+ * user row (so a role or store change made meanwhile is picked up). No access
+ * token required: the one it replaces is usually already expired.
+ */
+export const refresh = asyncHandler(async (req: Request, res: Response) => {
+  const { refresh_token } = req.body as { refresh_token: string };
+  const row = await findLiveRefreshToken(refresh_token);
+  if (!row) {
+    unauthorized(res, 'Sessione scaduta. Effettua di nuovo l\'accesso.', 'INVALID_REFRESH_TOKEN');
+    return;
+  }
+
+  const user = await queryOne<UserRow>(
+    `SELECT id, company_id, name, surname, email, role, store_id, supervisor_id, status, is_super_admin
+     FROM users WHERE id = $1`,
+    [row.user_id]
+  );
+  if (!user || user.status === 'inactive') {
+    await revokeRefreshToken(refresh_token);
+    unauthorized(res, 'Sessione scaduta. Effettua di nuovo l\'accesso.', 'INVALID_REFRESH_TOKEN');
+    return;
+  }
+
+  const companyBlock = await checkCompanyAccessWindow(user);
+  if (companyBlock) {
+    forbidden(res, companyBlock.message, companyBlock.code);
+    return;
+  }
+
+  await touchRefreshToken(row);
+  ok(res, { token: signTokenForUser(user), refresh_token });
+});
+
 export const logout = asyncHandler(async (req: Request, res: Response) => {
-  // Phase 1: stateless JWT — token is discarded by client.
-  // jti blacklist deferred to future phase.
+  // The access token is stateless and simply discarded by the client; the
+  // refresh token is revoked here so it cannot mint new sessions.
+  const { refresh_token } = (req.body ?? {}) as { refresh_token?: unknown };
+  if (typeof refresh_token === 'string') await revokeRefreshToken(refresh_token);
+
   // Log logout event for audit trail.
   if (req.user) {
-    const ip = (req.headers['x-forwarded-for'] as string) || req.socket.remoteAddress || 'unknown';
+    const ip = clientIp(req);
     await query(
       `INSERT INTO audit_logs (company_id, user_id, action, entity_type, entity_id, ip_address)
        VALUES ($1, $2, 'LOGOUT', 'user', $3, $4)`,
@@ -203,7 +271,7 @@ export const me = asyncHandler(async (req: Request, res: Response) => {
 
 export const changePassword = asyncHandler(async (req: Request, res: Response) => {
   // Axios interceptor sends snake_case; Zod schema validated as snake_case
-  const { current_password, new_password } = req.body as { current_password: string; new_password: string };
+  const { current_password, new_password, refresh_token } = req.body as { current_password: string; new_password: string; refresh_token?: string };
 
   const user = await queryOne<{ password_hash: string; company_id: number | null }>(
     `SELECT password_hash, company_id FROM users WHERE id = $1`,
@@ -222,6 +290,8 @@ export const changePassword = asyncHandler(async (req: Request, res: Response) =
 
   const newHash = await bcrypt.hash(new_password, 12);
   await query(`UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2`, [newHash, req.user!.userId]);
+  // A new password ends every other session; the device making the change stays in.
+  await revokeAllRefreshTokensForUser(req.user!.userId, refresh_token ?? null);
 
   // Return new token so client stays logged in
   const updatedUser = await queryOne<UserRow>(
@@ -229,15 +299,7 @@ export const changePassword = asyncHandler(async (req: Request, res: Response) =
     [req.user!.userId]
   );
 
-  const token = signAuthToken({
-    userId: updatedUser!.id,
-    email: updatedUser!.email,
-    role: updatedUser!.role,
-    companyId: updatedUser!.company_id,
-    storeId: updatedUser!.store_id,
-    supervisorId: updatedUser!.supervisor_id,
-    is_super_admin: updatedUser!.is_super_admin,
-  });
+  const token = signTokenForUser(updatedUser!);
 
   ok(res, { token }, 'Password aggiornata con successo');
 });

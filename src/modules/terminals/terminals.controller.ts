@@ -5,6 +5,7 @@ import { asyncHandler } from '../../utils/asyncHandler';
 import { assertLicenseCapacity } from '../billing/license.service';
 import bcrypt from 'bcryptjs';
 import { resolveAllowedCompanyIds } from '../../utils/companyScope';
+import { revokeAllRefreshTokensForUser } from '../auth/refreshTokens';
 
 /**
  * Whether the terminal has actually completed device registration.
@@ -305,6 +306,11 @@ export const updateTerminal = asyncHandler(async (req: Request, res: Response) =
     `UPDATE users SET ${updates.join(', ')}, updated_at = NOW() WHERE id = $${params.length}`,
     params
   );
+
+  // A new terminal password ends the sessions opened with the old one.
+  if (password && password !== terminal.plain_password) {
+    await revokeAllRefreshTokensForUser(terminalId);
+  }
 
   query(
     `INSERT INTO audit_logs (company_id, user_id, action, entity_type, entity_id)

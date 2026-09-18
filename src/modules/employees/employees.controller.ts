@@ -10,6 +10,7 @@ import { recordHeadcountEvent } from '../billing/headcount.service';
 import { assertLicenseCapacity } from '../billing/license.service';
 import { resolveAreaManagerStoreIds } from '../../utils/storeScope';
 import { UserRole } from '../../config/jwt';
+import { revokeAllRefreshTokensForUser } from '../auth/refreshTokens';
 import {
   resolveAllowedCompanyIds,
   resolveCompanyGroupId,
@@ -1224,6 +1225,11 @@ export const updateEmployee = asyncHandler(async (req: Request, res: Response) =
   if (!employee) {
     notFound(res, 'Dipendente non trovato');
     return;
+  }
+
+  // A password set by HR ends the employee's saved sessions on every device.
+  if (passwordHash) {
+    await revokeAllRefreshTokensForUser(empId);
   }
 
   if (newlyAddedOffDays.length > 0) {
