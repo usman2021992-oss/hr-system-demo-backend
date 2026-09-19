@@ -59,6 +59,25 @@ describe('GET /api/home', () => {
     expect(Array.isArray(data.statusBreakdown)).toBe(true);
   });
 
+  it('hr: expiring contracts come from contract_end_date, not termination_date', async () => {
+    await testPool.query(
+      `UPDATE users SET contract_end_date = CURRENT_DATE + 10, termination_date = NULL WHERE id = $1`,
+      [seeds.employee1Id],
+    );
+    try {
+      const token = await loginAs('hr@acme-test.com');
+      const res = await request.get('/api/home').set('Authorization', `Bearer ${token}`);
+      expect(res.status).toBe(200);
+      const { data } = res.body;
+      expect(data.expiringContractsCount).toBeGreaterThanOrEqual(1);
+      const row = data.expiringContracts.find((c: { id: number }) => c.id === seeds.employee1Id);
+      expect(row).toBeDefined();
+      expect(row.contract_end_date ?? row.contractEndDate).toBeTruthy();
+    } finally {
+      await testPool.query(`UPDATE users SET contract_end_date = NULL WHERE id = $1`, [seeds.employee1Id]);
+    }
+  });
+
   it('area_manager: has assignedStores array', async () => {
     const token = await loginAs('area@acme-test.com');
     const res = await request.get('/api/home').set('Authorization', `Bearer ${token}`);

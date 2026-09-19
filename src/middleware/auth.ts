@@ -27,6 +27,23 @@ export function authenticate(req: Request, res: Response, next: NextFunction): v
   }
 }
 
+/**
+ * Like authenticate(), but lets the request through without req.user when the
+ * token is missing or invalid. For endpoints that must still work once the
+ * session has expired (logout).
+ */
+export function optionalAuthenticate(req: Request, _res: Response, next: NextFunction): void {
+  const authHeader = req.headers.authorization;
+  if (authHeader?.startsWith('Bearer ')) {
+    try {
+      req.user = verifyAuthToken(authHeader.slice(7));
+    } catch {
+      /* expired or invalid — proceed unauthenticated */
+    }
+  }
+  next();
+}
+
 export function requireRole(...roles: UserRole[]) {
   return (req: Request, res: Response, next: NextFunction): void => {
     if (!req.user) {

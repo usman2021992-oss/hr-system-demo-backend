@@ -30,11 +30,6 @@ export const getHomeData = asyncHandler(async (req: Request, res: Response) => {
       const tr = req.query.timeRange || req.query.time_range || req.query.timerange || 'this_month';
       const timeRange = String(tr).trim().toLowerCase();
 
-      // DEBUG: Log the received parameters to a file in the workspace
-      const fs = require('fs');
-      const logMsg = `[${new Date().toISOString()}] req.query: ${JSON.stringify(req.query)}, resolved timeRange: ${timeRange}\n`;
-      fs.appendFileSync('home_debug.log', logMsg);
-
       const now = new Date();
       let startDate: Date;
       let endDate: Date = new Date(now);
@@ -329,9 +324,9 @@ export const getHomeData = asyncHandler(async (req: Request, res: Response) => {
         totalStoresRes, expiringContractsCountRes, nextShiftRow,
       ] = await Promise.all([
         query(
-          `SELECT id, name, surname, store_id, termination_date AS contract_end_date FROM users
-           WHERE company_id = ANY($1) AND status = 'active' AND role != 'store_terminal' AND termination_date BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '30 days'
-           ORDER BY termination_date LIMIT 10`,
+          `SELECT id, name, surname, store_id, contract_end_date FROM users
+           WHERE company_id = ANY($1) AND status = 'active' AND role != 'store_terminal' AND contract_end_date BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '30 days'
+           ORDER BY contract_end_date LIMIT 10`,
           [allowedCompanyIds]
         ),
         query(
@@ -412,7 +407,7 @@ export const getHomeData = asyncHandler(async (req: Request, res: Response) => {
           [allowedCompanyIds]
         ),
         queryOne<{ count: string }>(
-          `SELECT COUNT(*) AS count FROM users WHERE company_id = ANY($1) AND status = 'active' AND role != 'store_terminal' AND termination_date BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '30 days'`,
+          `SELECT COUNT(*) AS count FROM users WHERE company_id = ANY($1) AND status = 'active' AND role != 'store_terminal' AND contract_end_date BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '30 days'`,
           [allowedCompanyIds]
         ),
         // Caller's own next shift
