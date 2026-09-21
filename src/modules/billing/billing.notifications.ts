@@ -7,6 +7,7 @@ import {
 } from '../../services/platformEmail.service';
 import { sendNotification } from '../notifications/notifications.service';
 import { taxCentsOnLines } from './tax';
+import { getEmailBrand, renderBillingEmail } from '../../services/emailTemplate';
 
 /**
  * What happens when a renewal fails.
@@ -258,17 +259,12 @@ export async function sendPaymentFailedNotices(
   const deadline = formatDateIt(notice.gracePeriodEndsAt);
   const billingUrl = `${appBaseUrl()}/impostazioni/fatturazione`;
   const amount = formatMoney(notice.amountCents, notice.currency);
-  const amountLine = notice.amountCents ? ` (importo: ${amount})` : '';
   const testTag = notice.isTest ? '[TEST] ' : '';
-  const testNoteHtml = notice.isTest
-    ? `<p style="padding:8px;background:#fef3c7;border:1px solid #f59e0b">
-         <strong>Questo &egrave; un messaggio di prova.</strong> Nessun pagamento &egrave;
-         stato rifiutato e nessun accesso sar&agrave; sospeso.
-       </p>`
-    : '';
-  const testNoteText = notice.isTest
-    ? "ATTENZIONE: questo e' un messaggio di prova. Nessun pagamento e' stato rifiutato.\n\n"
-    : '';
+
+  // The logo, the brand name and the legal footer, read once and used by both
+  // emails below. A failure here must not stop the warning going out, so it
+  // falls back to the built-in defaults rather than throwing.
+  const brand = await getEmailBrand();
 
   const delivery: NoticeDelivery = {
     ownerEmail: null,
@@ -355,11 +351,6 @@ export async function sendPaymentFailedNotices(
     // asks the customer to approve a charge their bank is holding; the other
     // asks them to fix a payment method. Sending the wrong one costs them a
     // call to their bank about a card that was never refused.
-    const reasonLine = notice.failureMessage
-      ? `<p>Motivo: ${notice.failureMessage}</p>`
-      : '';
-    const reasonLineText = notice.failureMessage ? `Motivo: ${notice.failureMessage}\n\n` : '';
-
     // The 3D Secure link is the whole point of that email, so it leads; for a
     // decline the billing page is where a card gets replaced.
     const actionHref = notice.requiresAction && notice.actionUrl ? notice.actionUrl : billingUrl;
@@ -367,36 +358,42 @@ export async function sendPaymentFailedNotices(
       ? 'Completa la conferma del pagamento'
       : 'Aggiorna il metodo di pagamento';
 
-    const html =
-      testNoteHtml +
-      `<p>Gentile ${owner.name},</p>` +
-      (notice.requiresAction
-        ? `<p>Il rinnovo dell'abbonamento Veylo HR per <strong>${notice.companyName}</strong> ` +
-          `&egrave; in attesa della tua conferma 3D Secure` +
-          `${notice.amountCents ? ` (importo: <strong>${amount}</strong>)` : ''}. ` +
-          `La carta non &egrave; stata rifiutata: la banca richiede la tua approvazione per completare l'addebito.</p>`
-        : `<p>Il rinnovo automatico dell'abbonamento Veylo HR per <strong>${notice.companyName}</strong> ` +
-          `non &egrave; andato a buon fine${notice.amountCents ? ` (importo: <strong>${amount}</strong>)` : ''}.</p>`) +
-      reasonLine +
-      `<p>Per non interrompere il servizio &egrave; necessario completare il pagamento ` +
-      `<strong>entro il ${deadline}</strong>. Dopo tale data l'accesso alla piattaforma sar&agrave; sospeso.</p>` +
-      `<p>${actionLabel}:<br><a href="${actionHref}">${actionHref}</a></p>` +
-      `<p>Se il pagamento &egrave; gi&agrave; stato completato puoi ignorare questo messaggio.</p>` +
-      `<p>Cordiali saluti,<br>Team Veylo HR</p>`;
+    const facts = [
+      { label: 'Azienda', value: notice.companyName },
+      ...(notice.amountCents ? [{ label: 'Importo', value: amount }] : []),
+      { label: 'Da completare entro', value: deadline },
+      ...(notice.failureMessage ? [{ label: 'Motivo', value: notice.failureMessage }] : []),
+    ];
 
-    const text =
-      testNoteText +
-      `Gentile ${owner.name},\n\n` +
-      (notice.requiresAction
-        ? `Il rinnovo dell'abbonamento Veylo HR per ${notice.companyName} e' in attesa della tua conferma 3D Secure${amountLine}. ` +
-          `La carta non e' stata rifiutata: la banca richiede la tua approvazione per completare l'addebito.\n\n`
-        : `Il rinnovo automatico dell'abbonamento Veylo HR per ${notice.companyName} non e' andato a buon fine${amountLine}.\n\n`) +
-      reasonLineText +
-      `Per non interrompere il servizio e' necessario completare il pagamento entro il ${deadline}. ` +
-      `Dopo tale data l'accesso alla piattaforma sara' sospeso.\n\n` +
-      `${actionLabel}: ${actionHref}\n\n` +
-      `Se il pagamento e' gia' stato completato puoi ignorare questo messaggio.\n\n` +
-      `Cordiali saluti,\nTeam Veylo HR`;
+    const { html, text } = renderBillingEmail(
+      {
+        // Red is reserved for money that did not arrive. A 3D Secure hold gets
+        // amber: nothing is wrong, somebody just has to approve it, and
+        // colouring the two alike would teach the reader to ignore both.
+        banner: notice.isTest
+          ? { tone: 'info', text: 'Messaggio di prova - nessun pagamento e stato rifiutato' }
+          : notice.requiresAction
+            ? { tone: 'warning', text: 'Conferma richiesta per completare il pagamento' }
+            : { tone: 'danger', text: 'Pagamento non riuscito' },
+        greeting: `Gentile ${owner.name},`,
+        title: notice.requiresAction
+          ? 'Il rinnovo attende la tua conferma'
+          : 'Il rinnovo dell’abbonamento non è andato a buon fine',
+        paragraphs: notice.requiresAction
+          ? [
+              `La tua banca richiede la conferma 3D Secure per completare l’addebito del rinnovo. La carta non è stata rifiutata: serve solo la tua approvazione.`,
+              `Per non interrompere il servizio, completa la conferma entro il ${deadline}. Dopo tale data l’accesso alla piattaforma sarà sospeso.`,
+            ]
+          : [
+              `Il rinnovo automatico dell’abbonamento non è andato a buon fine.`,
+              `Per non interrompere il servizio è necessario completare il pagamento entro il ${deadline}. Dopo tale data l’accesso alla piattaforma sarà sospeso.`,
+            ],
+        facts,
+        action: { label: actionLabel, url: actionHref },
+        note: 'Se il pagamento è già stato completato puoi ignorare questo messaggio.',
+      },
+      brand
+    );
 
     // The owner is the addressee; the generic company mailbox is copied only
     // when it is a different address, so nobody receives the same mail twice.
@@ -448,44 +445,47 @@ export async function sendPaymentFailedNotices(
   delivery.copyTo = operators.join(', ');
 
   try {
-    const reasonHtml = notice.failureMessage
-      ? `<p>Motivo riportato dal gateway: ${notice.failureMessage}</p>`
-      : '';
-    const ownerLine = owner
-      ? `Il titolare (${owner.email}) &egrave; stato avvisato via email (${describeStatusIt(delivery.ownerStatus)}).`
-      : 'ATTENZIONE: nessun indirizzo del titolare trovato, il cliente NON &egrave; stato avvisato via email.';
-
     // No company fallback here, deliberately. This message names a customer
     // and their failed payment; pushing it through that same customer's mail
     // server would put the platform's own business into their mail logs. When
     // the platform mailbox is not configured the copy is reported as not sent,
     // which is the thing the operator needs to know anyway.
-    const result = await sendPlatformEmail({
-      to: delivery.copyTo,
-      subject: `${testTag}[VeylOHR] Pagamento fallito - ${notice.companyName} (blocco il ${deadline})`,
-      html:
-        testNoteHtml +
-        `<p>Il pagamento ricorrente di <strong>${notice.companyName}</strong> non &egrave; andato a buon fine.</p>` +
-        `<ul>` +
-        `<li>Provider: ${notice.provider}</li>` +
-        `<li>Importo: ${amount}</li>` +
-        `<li>Periodo di tolleranza: ${notice.graceDays} giorni</li>` +
-        `<li>Accesso sospeso a partire dal: <strong>${deadline}</strong></li>` +
-        `<li>Notifiche in-app inviate: ${delivery.inAppCount}</li>` +
-        `</ul>` +
-        reasonHtml +
-        `<p>${ownerLine}</p>`,
-      text:
-        testNoteText +
-        `Il pagamento ricorrente di ${notice.companyName} non e' andato a buon fine.\n` +
-        `Provider: ${notice.provider}\n` +
-        `Importo: ${amount}\n` +
-        `Periodo di tolleranza: ${notice.graceDays} giorni\n` +
-        `Accesso sospeso a partire dal: ${deadline}\n` +
-        `Notifiche in-app inviate: ${delivery.inAppCount}\n` +
-        (notice.failureMessage ? `Motivo: ${notice.failureMessage}\n` : '') +
-        `\n${owner ? `Titolare avvisato: ${owner.email} (${describeStatusIt(delivery.ownerStatus)})` : 'ATTENZIONE: titolare NON avvisato via email.'}`,
-    }, null);
+    const operatorMail = renderBillingEmail(
+      {
+        banner: notice.isTest
+          ? { tone: 'info', text: 'Messaggio di prova' }
+          : { tone: 'danger', text: 'Pagamento cliente non riuscito' },
+        title: `${notice.companyName}: pagamento non riuscito`,
+        paragraphs: [
+          owner
+            ? `Il titolare (${owner.email}) è stato avvisato via email: ${describeStatusIt(delivery.ownerStatus)}.`
+            : 'ATTENZIONE: nessun indirizzo del titolare trovato, il cliente NON è stato avvisato via email.',
+        ],
+        facts: [
+          { label: 'Azienda', value: notice.companyName },
+          { label: 'Provider', value: notice.provider },
+          { label: 'Importo', value: amount },
+          { label: 'Periodo di tolleranza', value: `${notice.graceDays} giorni` },
+          { label: 'Accesso sospeso dal', value: deadline },
+          { label: 'Notifiche in-app inviate', value: String(delivery.inAppCount) },
+          ...(notice.failureMessage
+            ? [{ label: 'Motivo riportato dal gateway', value: notice.failureMessage }]
+            : []),
+        ],
+        signature: 'Notifica automatica',
+      },
+      brand
+    );
+
+    const result = await sendPlatformEmail(
+      {
+        to: delivery.copyTo,
+        subject: `${testTag}[${brand.brandName}] Pagamento fallito - ${notice.companyName} (blocco il ${deadline})`,
+        html: operatorMail.html,
+        text: operatorMail.text,
+      },
+      null
+    );
     delivery.copyStatus = statusOf(result);
   } catch (err: any) {
     delivery.copyStatus = 'failed';

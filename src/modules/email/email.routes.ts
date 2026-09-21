@@ -36,6 +36,12 @@ function publicPlatformConfig(cfg: Awaited<ReturnType<typeof getPlatformSmtpConf
     smtpUser: cfg.smtpUser,
     smtpFrom: cfg.smtpFrom,
     billingAlertEmail: cfg.billingAlertEmail,
+    // What the customer sees in their inbox. Not secret, and editable here so
+    // a logo change does not need a deploy.
+    brandName: cfg.brandName,
+    logoUrl: cfg.logoUrl,
+    supplierName: cfg.supplierName,
+    supplierDetails: cfg.supplierDetails,
     hasPassword: cfg.smtpPass !== '',
     configured: isPlatformSmtpConfigured(cfg),
     verifiedAt: cfg.verifiedAt,
@@ -101,6 +107,16 @@ router.put(
       return;
     }
 
+    // The brand block is optional: a caller that only touches credentials does
+    // not have to resend it, and `undefined` keeps what is stored.
+    const pick = (...names: string[]): string | undefined => {
+      for (const n of names) {
+        const v = (body as any)[n];
+        if (typeof v === 'string') return v;
+      }
+      return undefined;
+    };
+
     const saved = await savePlatformSmtpConfig({
       smtpHost,
       smtpPort: port,
@@ -108,6 +124,10 @@ router.put(
       smtpPass,
       smtpFrom,
       billingAlertEmail,
+      brandName: pick('brand_name', 'brandName'),
+      logoUrl: pick('logo_url', 'logoUrl'),
+      supplierName: pick('supplier_name', 'supplierName'),
+      supplierDetails: pick('supplier_details', 'supplierDetails'),
     });
 
     ok(res, publicPlatformConfig(saved), 'Platform SMTP configuration saved');
@@ -146,13 +166,13 @@ router.post(
     const result = await sendPlatformEmail(
       {
         to,
-        subject: '[TEST] VeylOHR - configurazione email piattaforma',
+        subject: '[TEST] Veylo HR - configurazione email piattaforma',
         html:
-          '<p>Questa &egrave; una email di prova inviata dalla casella della piattaforma VeylOHR.</p>' +
+          '<p>Questa &egrave; una email di prova inviata dalla casella della piattaforma Veylo HR.</p>' +
           '<p>Se la stai leggendo, la configurazione SMTP della piattaforma funziona e gli avvisi ' +
           'di pagamento non riuscito verranno recapitati.</p>',
         text:
-          "Questa e' una email di prova inviata dalla casella della piattaforma VeylOHR.\n\n" +
+          "Questa e' una email di prova inviata dalla casella della piattaforma Veylo HR.\n\n" +
           "Se la stai leggendo, la configurazione SMTP della piattaforma funziona e gli avvisi " +
           'di pagamento non riuscito verranno recapitati.',
       },

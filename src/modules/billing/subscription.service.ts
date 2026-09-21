@@ -428,18 +428,32 @@ export class SubscriptionService {
       },
     });
 
+    // Which provider account this subscription now lives in. Recorded at
+    // creation because it can never be recovered afterwards: once the keys
+    // change, the provider answers "no such subscription" and there is nothing
+    // left to ask. Best effort - a null means "assume it is ours", which is
+    // the behaviour every row had before this existed.
+    let providerAccountId: string | null = null;
+    try {
+      providerAccountId = (await (gateway as any).getAccountId?.()) ?? null;
+    } catch (err: any) {
+      console.warn('[Billing] Could not read the provider account id:', err?.message || err);
+    }
+
     // F. Store checkout session info
     await pool.query(
       `UPDATE subscriptions 
        SET checkout_session_id = $1,
            provider_customer_id = $2,
-           provider_subscription_id = COALESCE($3, provider_subscription_id)
+           provider_subscription_id = COALESCE($3, provider_subscription_id),
+           provider_account_id = COALESCE($5, provider_account_id)
        WHERE id = $4`,
       [
         checkoutResult.sessionId,
         checkoutResult.providerCustomerId || null,
         checkoutResult.providerSubscriptionId || null,
         subscriptionId,
+        providerAccountId,
       ]
     );
 
@@ -1036,8 +1050,8 @@ export class SubscriptionService {
         company_id, subscription_id, provider,
         amount_cents, currency,
         status, kind, description,
-        failure_code, failure_message
-      ) VALUES ($1, $2, $3, $4, $5, 'failed', 'failed', $6, $7, $8)
+        failure_code, failure_message, invoice_url
+      ) VALUES ($1, $2, $3, $4, $5, 'failed', 'failed', $6, $7, $8, $9)
       RETURNING id`,
       [
         sub.company_id,
@@ -1048,6 +1062,11 @@ export class SubscriptionService {
         `Payment attempt failed`,
         event.failureCode || 'payment_failed',
         event.failureMessage || 'Payment declined by gateway',
+        // For a 3D Secure hold this is the page that completes the payment, so
+        // it is the single most useful thing on the row. Stored rather than
+        // left on the webhook, because the nightly retry has to be able to
+        // send the same link again days later.
+        event.actionUrl || event.invoiceUrl || null,
       ]
     );
 

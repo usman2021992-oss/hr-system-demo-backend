@@ -132,6 +132,20 @@ router.get(
   (req, res) => billingController.getHeadcountHistory(req, res)
 );
 
+// Clearing a company's billing history. Super admin only, and split in two on
+// purpose: the preview is what makes the confirmation meaningful.
+router.get(
+  '/admin/companies/:id/reset-preview',
+  requireSuperAdmin,
+  (req, res) => billingController.previewReset(req, res)
+);
+
+router.post(
+  '/admin/companies/:id/reset',
+  requireSuperAdmin,
+  (req, res) => billingController.resetBilling(req, res)
+);
+
 // Super Admin billing endpoints
 router.get(
   '/admin/overview',

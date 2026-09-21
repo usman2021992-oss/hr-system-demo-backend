@@ -1,7 +1,32 @@
 import cron from 'node-cron';
 import { pool } from '../config/database';
 import { getPaymentGateway } from '../modules/billing/gateway.factory';
-import { sendEmailForCompany } from '../services/email.service';
+import { sendPlatformEmail } from '../services/platformEmail.service';
+import { getEmailBrand, renderBillingEmail } from '../services/emailTemplate';
+import {
+  recordNoticeDelivery,
+  resolveFailureRecipients,
+  sendPaymentFailedNotices,
+} from '../modules/billing/billing.notifications';
+
+/** Italian money formatting, matching the failed-payment emails. */
+function formatMoneyIt(cents: number, currency: string): string {
+  const formatted = (cents / 100).toLocaleString('it-IT', {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  });
+  return currency === 'EUR' ? `€ ${formatted}` : `${formatted} ${currency}`;
+}
+
+/** Where the customer manages their subscription. */
+function appBaseUrl(): string {
+  const raw =
+    process.env.APP_BASE_URL ??
+    process.env.FRONTEND_URL ??
+    process.env.PUBLIC_APP_URL ??
+    process.env.CORS_ORIGIN?.split(',')[0];
+  return (raw && raw.trim() !== '' ? raw : 'http://localhost:5173').replace(/\/+$/, '');
+}
 import { getTaxConfig, taxCentsOnLines } from '../modules/billing/tax';
 import { realignSubscriptionTaxRates, syncBillingTaxRate } from '../modules/billing/tax.sync';
 import {
@@ -111,9 +136,10 @@ export async function processStuckLicenseUpgrades() {
 
 export async function processBillingReminders() {
   try {
-    // Find active subscriptions where current_period_end is approaching within bill_reminder_days_before days
+    // Find active subscriptions renewing within the company's reminder window
+    // that have not been reminded for this billing period yet.
     const subRes = await pool.query(
-      `SELECT s.*, c.name AS company_name, c.company_email, 
+      `SELECT s.*, c.name AS company_name, c.company_email,
               c.price_per_employee, c.price_per_device,
               c.bill_reminder_days_before
        FROM subscriptions s
@@ -128,8 +154,31 @@ export async function processBillingReminders() {
          )`
     );
 
+    const brand = await getEmailBrand();
+    const billingUrl = `${appBaseUrl()}/impostazioni/fatturazione`;
+
     for (const sub of subRes.rows) {
-      if (sub.company_email) {
+      try {
+        // Addressed like the failed-payment warning: to the person who owns
+        // the account, from the platform's own mailbox. It used to go to the
+        // generic company address through that company's SMTP, which meant a
+        // customer without their own mail server was never reminded at all.
+        const recipients = await resolveFailureRecipients(sub.company_id);
+        const owner = recipients.owner;
+        const to = owner
+          ? recipients.companyEmail &&
+            recipients.companyEmail.toLowerCase() !== owner.email.toLowerCase()
+            ? `${owner.email}, ${recipients.companyEmail}`
+            : owner.email
+          : recipients.companyEmail;
+
+        if (!to) {
+          console.warn(
+            `[BillingJob] No reminder recipient for company ${sub.company_id}; skipping.`
+          );
+          continue;
+        }
+
         // The reminder has to quote what will actually be taken, so it states
         // the same subtotal / tax / total the provider will charge rather than
         // the net figure alone.
@@ -137,32 +186,71 @@ export async function processBillingReminders() {
         const deviceCents = Math.round(sub.device_quantity * parseFloat(sub.unit_price_device) * 100);
         const taxCents = taxCentsOnLines([seatCents, deviceCents]);
         const taxPercent = getTaxConfig().percent;
-        const nextSubtotal = ((seatCents + deviceCents) / 100).toFixed(2);
-        const nextTotal = ((seatCents + deviceCents + taxCents) / 100).toFixed(2);
-        const taxLine =
-          taxCents > 0
-            ? ` (imponibile €${nextSubtotal} + IVA ${taxPercent}% €${(taxCents / 100).toFixed(2)})`
-            : '';
-
+        const currency = sub.currency || 'EUR';
         const renewalDate = new Date(sub.current_period_end).toLocaleDateString('it-IT');
 
-        await sendEmailForCompany(sub.company_id, {
-          to: sub.company_email,
-          subject: `Promemoria rinnovo abbonamento VeylOHR - ${sub.company_name}`,
-          html: `<p>Gentile Cliente,</p><p>Ti informiamo che il tuo abbonamento mensile VeylOHR per <strong>${sub.company_name}</strong> si rinnoverà il <strong>${renewalDate}</strong>.</p><p>Importo previsto: <strong>€${nextTotal}</strong>${taxLine} (${sub.seat_quantity} dipendenti attivi, ${sub.device_quantity} terminali).</p><p>Cordiali saluti,<br>Team VeylOHR</p>`,
-          text: `Gentile Cliente,\n\nTi informiamo che il tuo abbonamento mensile VeylOHR per ${sub.company_name} si rinnoverà il ${renewalDate}.\n\nImporto previsto: €${nextTotal}${taxLine} (${sub.seat_quantity} dipendenti attivi, ${sub.device_quantity} terminali).\n\nCordiali saluti,\nTeam VeylOHR`,
-        })
-          .then(async () => {
-            // Stamp only on success, so a transient mail failure is retried on
-            // the next daily run instead of being silently swallowed.
-            await pool.query(
-              `UPDATE subscriptions SET reminder_sent_at = NOW() WHERE id = $1`,
-              [sub.id]
-            );
-          })
-          .catch((err: any) =>
-            console.warn(`[BillingJob] Could not send reminder email to ${sub.company_email}:`, err.message)
+        const facts = [
+          { label: 'Azienda', value: sub.company_name },
+          { label: 'Data di rinnovo', value: renewalDate },
+          { label: 'Dipendenti', value: String(sub.seat_quantity) },
+          { label: 'Terminali', value: String(sub.device_quantity) },
+          { label: 'Imponibile', value: formatMoneyIt(seatCents + deviceCents, currency) },
+          ...(taxCents > 0
+            ? [{ label: `IVA ${taxPercent}%`, value: formatMoneyIt(taxCents, currency) }]
+            : []),
+          {
+            label: 'Totale previsto',
+            value: formatMoneyIt(seatCents + deviceCents + taxCents, currency),
+          },
+        ];
+
+        const { html, text } = renderBillingEmail(
+          {
+            banner: { tone: 'info', text: 'Promemoria di rinnovo' },
+            greeting: owner ? `Gentile ${owner.name},` : 'Gentile Cliente,',
+            title: `L’abbonamento si rinnova il ${renewalDate}`,
+            paragraphs: [
+              `Ti informiamo che l’abbonamento mensile per ${sub.company_name} si rinnoverà automaticamente il ${renewalDate}.`,
+              'Non devi fare nulla: l’addebito avverrà sul metodo di pagamento registrato.',
+            ],
+            facts,
+            action: { label: 'Vedi la fatturazione', url: billingUrl },
+            note: 'Se vuoi modificare le licenze o il metodo di pagamento, puoi farlo prima della data di rinnovo.',
+          },
+          brand
+        );
+
+        const result = await sendPlatformEmail(
+          {
+            to,
+            subject: `Promemoria rinnovo abbonamento ${brand.brandName} - ${sub.company_name}`,
+            html,
+            text,
+          },
+          sub.company_id
+        );
+
+        // Stamp only on a real send. sendPlatformEmail reports a skipped or
+        // refused delivery by returning ok:false rather than by throwing, so
+        // the old .then() marked the reminder as sent whenever the call
+        // completed - including every time it sent nothing - and it was then
+        // never retried for that period.
+        if (result.ok) {
+          await pool.query(`UPDATE subscriptions SET reminder_sent_at = NOW() WHERE id = $1`, [
+            sub.id,
+          ]);
+        } else {
+          console.warn(
+            `[BillingJob] Renewal reminder for company ${sub.company_id} not sent ` +
+              `(${result.status} via ${result.transport}): ${result.message ?? 'no detail'}. ` +
+              'It will be retried on the next run.'
           );
+        }
+      } catch (err: any) {
+        console.error(
+          `[BillingJob] Renewal reminder failed for company ${sub.company_id}:`,
+          err?.message || err
+        );
       }
     }
   } catch (err: any) {
@@ -212,16 +300,43 @@ export async function processSubscriptionPeriodDrift() {
   try {
     const subRes = await pool.query(
       `SELECT id, company_id, provider, provider_subscription_id,
-              current_period_start, current_period_end
+              provider_account_id, current_period_start, current_period_end
        FROM subscriptions
        WHERE status IN ('active', 'past_due')
          AND provider_subscription_id IS NOT NULL`
     );
 
     let corrected = 0;
+    let skippedForeign = 0;
+
+    // Which account the current keys act as, asked once for the whole sweep.
+    const currentAccounts = new Map<string, string | null>();
+    const accountFor = async (provider: string): Promise<string | null> => {
+      if (!currentAccounts.has(provider)) {
+        try {
+          const gw = getPaymentGateway(provider as any) as any;
+          currentAccounts.set(provider, (await gw.getAccountId?.()) ?? null);
+        } catch {
+          currentAccounts.set(provider, null);
+        }
+      }
+      return currentAccounts.get(provider) ?? null;
+    };
 
     for (const sub of subRes.rows) {
       try {
+        // A subscription created under different keys cannot be read back:
+        // the provider answers 404, which used to be logged as an error every
+        // single night for every such row. It is not an error - it is a
+        // subscription that belongs to another account - so it is skipped and
+        // counted. Rows with no recorded account predate the column and are
+        // still checked, which is the old behaviour.
+        const currentAccount = await accountFor(sub.provider);
+        if (sub.provider_account_id && currentAccount && sub.provider_account_id !== currentAccount) {
+          skippedForeign++;
+          continue;
+        }
+
         const gateway = getPaymentGateway(sub.provider);
         if (!gateway.getSubscriptionPeriod) continue;
 
@@ -268,6 +383,11 @@ export async function processSubscriptionPeriodDrift() {
 
     if (corrected > 0) {
       console.log(`[BillingJob] Billing periods corrected: ${corrected}`);
+    }
+    if (skippedForeign > 0) {
+      console.log(
+        `[BillingJob] Skipped ${skippedForeign} subscriptions created under different provider credentials.`
+      );
     }
   } catch (err) {
     console.error('[BillingJob] processSubscriptionPeriodDrift failed:', err);
@@ -316,6 +436,9 @@ export function startBillingCron() {
     await processSubscriptionPricingDrift();
     await processBillingRenewalReconciliations();
     await processBillingReminders();
+    // Before the expiry sweep, so a customer whose warning never arrived gets
+    // one more chance while the grace period is still running.
+    await processUndeliveredPaymentNotices();
     await processBillingGracePeriodExpirations();
     await syncBillingTaxRate();
     // After the rate is refreshed, not before: realignment attaches whatever
@@ -339,4 +462,93 @@ export function startBillingCron() {
   }, 30_000).unref();
 
   console.log('✓ Billing scheduled jobs initialized (daily at 02:00)');
+}
+
+/**
+ * Tries again for warnings that never actually reached the customer.
+ *
+ * The notification stamp is claimed before the send, deliberately: two webhook
+ * retries arriving together must not both decide they are the first. The cost
+ * of that is that a send which fails is never retried - the stamp says it was
+ * handled - so a customer whose mailbox was briefly unreachable is left
+ * believing nothing was wrong until their access stops.
+ *
+ * The outcome of every attempt is already recorded on the failed transaction,
+ * which makes the undelivered ones findable. This re-sends them once a night
+ * for as long as the grace period lasts, and stops the moment one is accepted.
+ * A few attempts over three days, bounded by the deadline itself.
+ */
+export async function processUndeliveredPaymentNotices() {
+  try {
+    const res = await pool.query(
+      `SELECT t.id            AS transaction_id,
+              t.amount_cents,
+              t.currency,
+              t.failure_code,
+              t.failure_message,
+              t.invoice_url,
+              s.id            AS subscription_id,
+              s.company_id,
+              s.provider,
+              s.grace_period_ends_at,
+              COALESCE(s.grace_period_days, 3) AS grace_period_days,
+              c.name          AS company_name
+         FROM billing_transactions t
+         JOIN subscriptions s ON s.id = t.subscription_id
+         JOIN companies c     ON c.id = s.company_id
+        WHERE t.status = 'failed'
+          AND s.status = 'past_due'
+          AND s.grace_period_ends_at IS NOT NULL
+          AND s.grace_period_ends_at > NOW()
+          -- Only the ones that genuinely did not arrive. 'sent' is done, and a
+          -- null status belongs to a row written before delivery was recorded.
+          AND t.notice_email_status IN ('failed', 'skipped', 'no_recipient')
+          -- The newest failure per subscription; an older one is superseded.
+          AND t.id = (
+            SELECT t2.id FROM billing_transactions t2
+             WHERE t2.subscription_id = s.id AND t2.status = 'failed'
+             ORDER BY t2.id DESC LIMIT 1
+          )`
+    );
+
+    if (res.rowCount === 0) return;
+
+    console.log(`[BillingJob] Retrying ${res.rowCount} undelivered payment warnings.`);
+
+    for (const row of res.rows) {
+      try {
+        const delivery = await sendPaymentFailedNotices({
+          companyId: row.company_id,
+          companyName: row.company_name,
+          provider: row.provider,
+          amountCents: row.amount_cents ?? null,
+          currency: row.currency || 'EUR',
+          gracePeriodEndsAt: new Date(row.grace_period_ends_at),
+          graceDays: row.grace_period_days,
+          failureMessage: row.failure_message ?? null,
+          // Rebuilt from what was stored rather than from the webhook, which
+          // is long gone: a 3D Secure hold must still send the link that
+          // completes it, not a generic "update your card".
+          requiresAction: row.failure_code === 'authentication_required',
+          actionUrl: row.invoice_url ?? null,
+        });
+
+        await recordNoticeDelivery(row.transaction_id, delivery);
+
+        if (delivery.ownerStatus === 'sent') {
+          console.log(
+            `[BillingJob] Payment warning for company ${row.company_id} delivered on retry.`
+          );
+          announceBillingChange(row.company_id, 'payment_failed_notified');
+        }
+      } catch (err: any) {
+        console.error(
+          `[BillingJob] Retry of the payment warning for company ${row.company_id} failed:`,
+          err?.message || err
+        );
+      }
+    }
+  } catch (err: any) {
+    console.error('[BillingJob] Error retrying undelivered payment warnings:', err);
+  }
 }

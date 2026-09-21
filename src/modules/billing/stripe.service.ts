@@ -59,11 +59,11 @@ export class StripeGateway implements IPaymentGateway {
           price_data: {
             currency,
             product_data: {
-              name: 'Employee Seats (VeylOHR)',
+              name: 'Licenze dipendenti',
               // Never hardcode a symbol here: the same text is shown on the
               // hosted checkout page, and a PKR subscription labelled in euros
               // misstates the price the customer is about to pay.
-              description: `Active employee license (${currencyLabel} ${(params.unitPriceEmployee || 0).toFixed(2)}/seat/month)`,
+              description: `Licenza dipendente attivo (${currencyLabel} ${(params.unitPriceEmployee || 0).toFixed(2)}/mese)`,
             },
             unit_amount: employeeUnitCents,
             recurring: {
@@ -89,8 +89,8 @@ export class StripeGateway implements IPaymentGateway {
           price_data: {
             currency,
             product_data: {
-              name: 'Terminal Devices (VeylOHR)',
-              description: `Active store terminal license (${currencyLabel} ${(params.unitPriceDevice || 0).toFixed(2)}/terminal/month)`,
+              name: 'Licenze terminali',
+              description: `Licenza terminale punto vendita (${currencyLabel} ${(params.unitPriceDevice || 0).toFixed(2)}/mese)`,
             },
             unit_amount: deviceUnitCents,
             recurring: {
@@ -212,7 +212,7 @@ export class StripeGateway implements IPaymentGateway {
           // Stripe adds the tax to it and collects the total.
           ...(taxRateId ? { tax_rates: [taxRateId] } : {}),
           description:
-            params.chargeDescription || 'Additional licenses (prorated to end of period)',
+            params.chargeDescription || 'Licenze aggiuntive (rateo fino a fine periodo)',
         },
         key ? { idempotencyKey: `${key}:item` } : undefined
       );
@@ -224,7 +224,7 @@ export class StripeGateway implements IPaymentGateway {
           collection_method: 'charge_automatically',
           auto_advance: false,
           description:
-            params.chargeDescription || 'Additional licenses (prorated to end of period)',
+            params.chargeDescription || 'Licenze aggiuntive (rateo fino a fine periodo)',
         },
         key ? { idempotencyKey: `${key}:invoice` } : undefined
       );
@@ -487,7 +487,7 @@ export class StripeGateway implements IPaymentGateway {
     }
 
     const created = await this.stripe.products.create({
-      name: 'Terminal Devices (VeylOHR)',
+      name: 'Licenze terminali',
       metadata: { veylohr_kind: 'terminal_license' },
     });
     this.terminalProductId = created.id;
@@ -835,6 +835,33 @@ export class StripeGateway implements IPaymentGateway {
       default_tax_rates: wanted,
     } as any);
     return true;
+  }
+
+  /**
+   * The Stripe account these keys belong to.
+   *
+   * Cached for the life of the process: the keys cannot change without a
+   * restart, so asking Stripe more than once tells us nothing new.
+   */
+  private cachedAccountId?: string | null;
+
+  async getAccountId(): Promise<string | null> {
+    if (this.cachedAccountId !== undefined) return this.cachedAccountId;
+
+    let resolved: string | null = null;
+    try {
+      // `accounts.retrieve()` with no id means "the account these keys belong
+      // to". The typings insist on an argument, hence the cast.
+      const account = await (this.stripe.accounts as any).retrieve();
+      resolved = account?.id ?? null;
+    } catch (err: any) {
+      // Not fatal. An unknown account id means "do not claim a mismatch",
+      // which keeps the old behaviour rather than hiding live subscriptions.
+      console.warn('[Stripe] Could not read the account id:', err?.message || err);
+    }
+
+    this.cachedAccountId = resolved;
+    return resolved;
   }
 
   /**

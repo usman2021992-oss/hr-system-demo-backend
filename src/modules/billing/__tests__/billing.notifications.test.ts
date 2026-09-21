@@ -34,7 +34,7 @@ function mockPlatformConfig(billingAlertEmail = '') {
     smtpPort: 587,
     smtpUser: 'billing@veylo.it',
     smtpPass: 'secret',
-    smtpFrom: 'VeylOHR <billing@veylo.it>',
+    smtpFrom: 'Veylo HR <billing@veylo.it>',
     billingAlertEmail,
     verifiedAt: null,
     lastError: null,
@@ -337,7 +337,11 @@ describe('sendPaymentFailedNotices', () => {
 
     const [options] = mockEmail.mock.calls[0];
     expect(options.subject).toContain('[TEST]');
-    expect(options.text).toContain('prova');
+    // Case-insensitive: the shared template upper-cases the banner line in the
+    // plain-text part. What matters is that the rehearsal says so, not how it
+    // is capitalised.
+    expect(options.text.toLowerCase()).toContain('prova');
+    expect(options.html.toLowerCase()).toContain('prova');
     expect(mockNotify.mock.calls[0][0].metadata.isTest).toBe(true);
   });
 });
