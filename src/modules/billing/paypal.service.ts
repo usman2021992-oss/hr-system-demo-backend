@@ -70,6 +70,18 @@ export class PayPalGateway implements IPaymentGateway {
       : 'https://api-m.sandbox.paypal.com';
   }
 
+  /**
+   * Which PayPal merchant these credentials act as.
+   *
+   * PayPal has no "who am I" call that returns a stable merchant id for a
+   * client-credentials token, so the client id itself is the identity: it is
+   * issued per app per merchant, and it changes exactly when the account does,
+   * which is the only thing this is used to detect.
+   */
+  async getAccountId(): Promise<string | null> {
+    return this.clientId || null;
+  }
+
   private async getAccessToken(): Promise<string> {
     const auth = Buffer.from(`${this.clientId}:${this.clientSecret}`).toString('base64');
     const response = await fetch(`${this.baseUrl}/v1/oauth2/token`, {
@@ -104,7 +116,7 @@ export class PayPalGateway implements IPaymentGateway {
         Authorization: `Bearer ${token}`,
       },
       body: JSON.stringify({
-        name: 'VeylOHR Platform Subscription',
+        name: 'Veylo HR Platform Subscription',
         description: 'Monthly company HR platform subscription',
         type: 'SERVICE',
         category: 'SOFTWARE',
@@ -148,7 +160,7 @@ export class PayPalGateway implements IPaymentGateway {
       },
       body: JSON.stringify({
         product_id: productId,
-        name: `VeylOHR Plan - ${params.companyName}`,
+        name: `Veylo HR Plan - ${params.companyName}`,
         description: `Monthly billing for ${params.seatQuantity} employees and ${params.deviceQuantity} terminals`,
         status: 'ACTIVE',
         billing_cycles: [
@@ -206,7 +218,7 @@ export class PayPalGateway implements IPaymentGateway {
             }
           : undefined,
         application_context: {
-          brand_name: 'VeylOHR',
+          brand_name: 'Veylo HR',
           locale: 'it-IT',
           shipping_preference: 'NO_SHIPPING',
           user_action: 'SUBSCRIBE_NOW',
@@ -260,7 +272,7 @@ export class PayPalGateway implements IPaymentGateway {
       },
       body: JSON.stringify({
         product_id: productId,
-        name: `VeylOHR Plan (Revised) - ${params.providerSubscriptionId}`,
+        name: `Veylo HR Plan (Revised) - ${params.providerSubscriptionId}`,
         description: `Revised billing for ${params.newSeatQuantity} employees and ${params.newDeviceQuantity} terminals`,
         status: 'ACTIVE',
         billing_cycles: [
@@ -375,7 +387,7 @@ export class PayPalGateway implements IPaymentGateway {
           Authorization: `Bearer ${token}`,
         },
         body: JSON.stringify({
-          reason: 'Customer requested cancellation via VeylOHR',
+          reason: 'Customer requested cancellation via Veylo HR',
         }),
       }
     );
@@ -400,7 +412,7 @@ export class PayPalGateway implements IPaymentGateway {
           Authorization: `Bearer ${token}`,
         },
         body: JSON.stringify({
-          reason: 'Reactivating subscription via VeylOHR',
+          reason: 'Reactivating subscription via Veylo HR',
         }),
       }
     );

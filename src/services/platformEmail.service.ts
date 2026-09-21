@@ -10,7 +10,7 @@ import { EmailOptions, EmailSendResult, sendEmailForCompany } from './email.serv
  * through the customer's SMTP server, which is correct.
  *
  * Billing mail is different. "Your subscription payment failed, settle it by
- * Friday" is VeylOHR writing to its customer. Sending that through the
+ * Friday" is Veylo HR writing to its customer. Sending that through the
  * customer's own mail server has two failure modes that both hurt exactly when
  * it matters:
  *
@@ -37,6 +37,15 @@ export interface PlatformSmtpConfig {
   smtpFrom: string;
   /** Comma-separated operator addresses copied on every failed payment. */
   billingAlertEmail: string;
+  /**
+   * What the customer sees in their inbox. Editable because a logo URL and a
+   * supplier's legal details are not the sort of thing that should need a
+   * deploy to change.
+   */
+  brandName: string;
+  logoUrl: string;
+  supplierName: string;
+  supplierDetails: string;
   verifiedAt: Date | null;
   lastError: string | null;
   updatedAt: Date | null;
@@ -54,6 +63,10 @@ const EMPTY: PlatformSmtpConfig = {
   smtpPass: '',
   smtpFrom: '',
   billingAlertEmail: '',
+  brandName: 'Veylo HR',
+  logoUrl: '',
+  supplierName: '',
+  supplierDetails: '',
   verifiedAt: null,
   lastError: null,
   updatedAt: null,
@@ -67,6 +80,13 @@ function rowToConfig(row: any): PlatformSmtpConfig {
     smtpPass: row.smtp_pass || '',
     smtpFrom: row.smtp_from || '',
     billingAlertEmail: row.billing_alert_email || '',
+    // The default matters: a row written before migration 144 has no brand
+    // name, and an email headed with an empty string is worse than one headed
+    // with the name the product has always had.
+    brandName: row.brand_name || 'Veylo HR',
+    logoUrl: row.logo_url || '',
+    supplierName: row.supplier_name || '',
+    supplierDetails: row.supplier_details || '',
     verifiedAt: row.verified_at ? new Date(row.verified_at) : null,
     lastError: row.last_error || null,
     updatedAt: row.updated_at ? new Date(row.updated_at) : null,
@@ -98,7 +118,20 @@ export async function savePlatformSmtpConfig(input: {
   smtpPass: string;
   smtpFrom: string;
   billingAlertEmail: string;
+  brandName?: string;
+  logoUrl?: string;
+  supplierName?: string;
+  supplierDetails?: string;
 }): Promise<PlatformSmtpConfig> {
+  // The brand block is optional on the way in so a caller that only changes
+  // credentials does not have to resend it - but an explicit empty string is
+  // a deliberate clearing, so only `undefined` falls back to what is stored.
+  const existingForBrand = await getPlatformSmtpConfig();
+  const brandName = input.brandName ?? existingForBrand.brandName;
+  const logoUrl = input.logoUrl ?? existingForBrand.logoUrl;
+  const supplierName = input.supplierName ?? existingForBrand.supplierName;
+  const supplierDetails = input.supplierDetails ?? existingForBrand.supplierDetails;
+
   const res = await pool.query(
     `UPDATE platform_smtp_config
         SET smtp_host           = $1,
@@ -107,6 +140,10 @@ export async function savePlatformSmtpConfig(input: {
             smtp_pass           = $4,
             smtp_from           = $5,
             billing_alert_email = $6,
+            brand_name          = $7,
+            logo_url            = $8,
+            supplier_name       = $9,
+            supplier_details    = $10,
             -- Any credential change invalidates the previous proof that they
             -- work, so the page stops claiming "verified" until it is re-run.
             verified_at         = NULL,
@@ -121,6 +158,10 @@ export async function savePlatformSmtpConfig(input: {
       input.smtpPass,
       input.smtpFrom.trim(),
       input.billingAlertEmail.trim(),
+      brandName.trim() || 'Veylo HR',
+      logoUrl.trim(),
+      supplierName.trim(),
+      supplierDetails.trim(),
     ]
   );
 
@@ -128,8 +169,9 @@ export async function savePlatformSmtpConfig(input: {
     // The seed row is created by the migration; recreate it rather than fail.
     const inserted = await pool.query(
       `INSERT INTO platform_smtp_config
-         (id, smtp_host, smtp_port, smtp_user, smtp_pass, smtp_from, billing_alert_email)
-       VALUES (1, $1, $2, $3, $4, $5, $6)
+         (id, smtp_host, smtp_port, smtp_user, smtp_pass, smtp_from, billing_alert_email,
+          brand_name, logo_url, supplier_name, supplier_details)
+       VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
        ON CONFLICT (id) DO UPDATE SET smtp_host = EXCLUDED.smtp_host
        RETURNING *`,
       [
@@ -139,6 +181,10 @@ export async function savePlatformSmtpConfig(input: {
         input.smtpPass,
         input.smtpFrom.trim(),
         input.billingAlertEmail.trim(),
+        brandName.trim() || 'Veylo HR',
+        logoUrl.trim(),
+        supplierName.trim(),
+        supplierDetails.trim(),
       ]
     );
     return rowToConfig(inserted.rows[0]);

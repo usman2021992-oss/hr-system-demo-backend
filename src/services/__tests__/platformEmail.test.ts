@@ -29,7 +29,7 @@ const CONFIGURED = {
   smtp_port: 587,
   smtp_user: 'billing@veylo.it',
   smtp_pass: 'secret',
-  smtp_from: 'VeylOHR <billing@veylo.it>',
+  smtp_from: 'Veylo HR <billing@veylo.it>',
   billing_alert_email: 'francesco@veylo.it',
   verified_at: null,
   last_error: null,
@@ -66,6 +66,10 @@ describe('platform mailbox configuration', () => {
         smtpPass: '',
         smtpFrom: '',
         billingAlertEmail: '',
+        brandName: 'Veylo HR',
+        logoUrl: '',
+        supplierName: '',
+        supplierDetails: '',
         verifiedAt: null,
         lastError: null,
         updatedAt: null,
@@ -94,7 +98,7 @@ describe('sendPlatformEmail', () => {
     expect(result.ok).toBe(true);
     expect(result.transport).toBe('platform');
     // The customer sees the platform's own From, not their own domain.
-    expect(sendMail.mock.calls[0][0].from).toBe('VeylOHR <billing@veylo.it>');
+    expect(sendMail.mock.calls[0][0].from).toBe('Veylo HR <billing@veylo.it>');
     expect(mockCompanySend).not.toHaveBeenCalled();
   });
 

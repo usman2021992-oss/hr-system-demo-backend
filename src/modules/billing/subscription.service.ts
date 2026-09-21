@@ -428,18 +428,32 @@ export class SubscriptionService {
       },
     });
 
+    // Which provider account this subscription now lives in. Recorded at
+    // creation because it can never be recovered afterwards: once the keys
+    // change, the provider answers "no such subscription" and there is nothing
+    // left to ask. Best effort - a null means "assume it is ours", which is
+    // the behaviour every row had before this existed.
+    let providerAccountId: string | null = null;
+    try {
+      providerAccountId = (await (gateway as any).getAccountId?.()) ?? null;
+    } catch (err: any) {
+      console.warn('[Billing] Could not read the provider account id:', err?.message || err);
+    }
+
     // F. Store checkout session info
     await pool.query(
       `UPDATE subscriptions 
        SET checkout_session_id = $1,
            provider_customer_id = $2,
-           provider_subscription_id = COALESCE($3, provider_subscription_id)
+           provider_subscription_id = COALESCE($3, provider_subscription_id),
+           provider_account_id = COALESCE($5, provider_account_id)
        WHERE id = $4`,
       [
         checkoutResult.sessionId,
         checkoutResult.providerCustomerId || null,
         checkoutResult.providerSubscriptionId || null,
         subscriptionId,
+        providerAccountId,
       ]
     );
 
@@ -579,7 +593,21 @@ export class SubscriptionService {
         [sub.id, activationKey]
       );
 
-      if (existingTx.rowCount === 0) {
+      // PayPal announces the subscription and the money separately, and its
+      // activation event carries neither a payment id nor an amount. Writing a
+      // row from it produced a duplicate: this one keyed on the activation
+      // event id and priced from seats x rate (so without VAT), and then a
+      // second from PAYMENT.SALE.COMPLETED, which could not match it and
+      // recorded the real charge again as a renewal.
+      //
+      // So PayPal records nothing here. The sale event writes the single row
+      // and labels it 'activation' when it is the first payment of the
+      // subscription. Stripe is unaffected: its checkout session carries the
+      // invoice id and the real total, and the invoice webhook that follows
+      // matches on that id rather than duplicating.
+      const providerReportsPaymentSeparately = event.provider === 'paypal';
+
+      if (existingTx.rowCount === 0 && !providerReportsPaymentSeparately) {
         await client.query(
           `INSERT INTO billing_transactions (
             company_id, subscription_id, provider,
@@ -894,6 +922,30 @@ export class SubscriptionService {
               100
           );
 
+        // The first money a subscription ever takes is its activation, not a
+        // renewal - and for PayPal this is the only row that will exist for
+        // it, because the activation event writes none. Decided by looking for
+        // an earlier settled payment rather than by trusting the event type,
+        // so a replayed or out-of-order webhook cannot mint a second
+        // activation.
+        const earlierPayment = await client.query(
+          `SELECT 1 FROM billing_transactions
+            WHERE subscription_id = $1
+              AND status IN ('paid', 'pending')
+              AND kind IN ('activation', 'renewal', 'license_upgrade', 'carried_over')
+            LIMIT 1`,
+          [sub.id]
+        );
+        const isFirstPayment = earlierPayment.rowCount === 0;
+
+        const paymentKind = collectedNothing
+          ? 'carried_over'
+          : hasPendingUpgrade
+            ? 'license_upgrade'
+            : isFirstPayment
+              ? 'activation'
+              : 'renewal';
+
         await client.query(
           `INSERT INTO billing_transactions (
             company_id, subscription_id, provider,
@@ -915,13 +967,15 @@ export class SubscriptionService {
             event.currency || sub.currency,
             hasPendingUpgrade
               ? `Licenze aggiuntive: ${nextSeatQty} dipendenti, ${nextDevQty} terminali`
-              : `Rinnovo mensile: ${nextSeatQty} dipendenti, ${nextDevQty} terminali`,
+              : isFirstPayment
+                ? `Attivazione abbonamento: ${nextSeatQty} dipendenti, ${nextDevQty} terminali`
+                : `Rinnovo mensile: ${nextSeatQty} dipendenti, ${nextDevQty} terminali`,
             nextSeatQty,
             nextDevQty,
             Math.round(parseFloat(sub.unit_price_employee) * 100),
             Math.round(parseFloat(sub.unit_price_device) * 100),
             event.invoiceUrl || null,
-            collectedNothing ? 'carried_over' : hasPendingUpgrade ? 'license_upgrade' : 'renewal',
+            paymentKind,
             collectedNothing ? 'pending' : 'paid',
             periodStart,
             periodEnd,
@@ -996,8 +1050,8 @@ export class SubscriptionService {
         company_id, subscription_id, provider,
         amount_cents, currency,
         status, kind, description,
-        failure_code, failure_message
-      ) VALUES ($1, $2, $3, $4, $5, 'failed', 'failed', $6, $7, $8)
+        failure_code, failure_message, invoice_url
+      ) VALUES ($1, $2, $3, $4, $5, 'failed', 'failed', $6, $7, $8, $9)
       RETURNING id`,
       [
         sub.company_id,
@@ -1008,6 +1062,11 @@ export class SubscriptionService {
         `Payment attempt failed`,
         event.failureCode || 'payment_failed',
         event.failureMessage || 'Payment declined by gateway',
+        // For a 3D Secure hold this is the page that completes the payment, so
+        // it is the single most useful thing on the row. Stored rather than
+        // left on the webhook, because the nightly retry has to be able to
+        // send the same link again days later.
+        event.actionUrl || event.invoiceUrl || null,
       ]
     );
 
@@ -1045,6 +1104,8 @@ export class SubscriptionService {
         gracePeriodEndsAt: deadline,
         graceDays,
         failureMessage: event.failureMessage ?? null,
+        requiresAction: event.requiresAction === true,
+        actionUrl: event.actionUrl ?? null,
       });
 
       await recordNoticeDelivery(failureRow.rows[0]?.id, delivery);

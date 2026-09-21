@@ -8,6 +8,18 @@ import { resolveAllowedCompanyIds } from '../../utils/companyScope';
 import { describeTaxConfig, getTaxConfig, loadTaxConfig, setStripeTaxRateId } from './tax';
 import { realignSubscriptionTaxRates, syncBillingTaxRate } from './tax.sync';
 import { getPaymentGateway } from './gateway.factory';
+import { previewBillingReset, resetCompanyBilling } from './billing.reset';
+import { announceBillingChange } from './subscription.service';
+
+/** The provider account the current credentials act as, or null if unknown. */
+async function currentProviderAccount(provider: string): Promise<string | null> {
+  try {
+    const gateway = getPaymentGateway(provider as any) as any;
+    return (await gateway.getAccountId?.()) ?? null;
+  } catch {
+    return null;
+  }
+}
 import { sendPaymentFailedTestNotice, resolveFailureRecipients } from './billing.notifications';
 import { getPlatformSmtpConfig, isPlatformSmtpConfigured } from '../../services/platformEmail.service';
 
@@ -568,13 +580,67 @@ export class BillingController {
   }
 
   /**
+   * GET /api/billing/admin/companies/:id/reset-preview
+   *
+   * What a reset would remove. Always shown before the button is offered: this
+   * is irreversible, and a count is the only way to notice you are about to
+   * clear the wrong company.
+   */
+  async previewReset(req: Request, res: Response) {
+    try {
+      const companyId = parseInt(String(req.params.id), 10);
+      if (!Number.isFinite(companyId) || companyId <= 0) {
+        return res.status(400).json({ error: 'A valid company id is required' });
+      }
+      const preview = await previewBillingReset(companyId, currentProviderAccount);
+      return res.json(preview);
+    } catch (err: any) {
+      console.error('[BillingController] previewReset error:', err);
+      return res.status(500).json({ error: err.message || 'Could not read the billing data' });
+    }
+  }
+
+  /**
+   * POST /api/billing/admin/companies/:id/reset
+   *
+   * Clears one company's billing history. Requires the company's own name in
+   * the body: a destructive action reached by a single click is a destructive
+   * action that eventually happens by accident.
+   */
+  async resetBilling(req: Request, res: Response) {
+    try {
+      const companyId = parseInt(String(req.params.id), 10);
+      if (!Number.isFinite(companyId) || companyId <= 0) {
+        return res.status(400).json({ error: 'A valid company id is required' });
+      }
+
+      const body = (req.body || {}) as Record<string, unknown>;
+      const confirmation = String(body.confirm ?? body.confirmation ?? '').trim();
+
+      const preview = await previewBillingReset(companyId, currentProviderAccount);
+      if (confirmation.toLowerCase() !== preview.companyName.trim().toLowerCase()) {
+        return res.status(400).json({
+          error: `Type the company name exactly ("${preview.companyName}") to confirm.`,
+        });
+      }
+
+      const result = await resetCompanyBilling(companyId);
+      announceBillingChange(companyId, 'billing_reset');
+      return res.json(result);
+    } catch (err: any) {
+      console.error('[BillingController] resetBilling error:', err);
+      return res.status(500).json({ error: err.message || 'Could not clear the billing data' });
+    }
+  }
+
+  /**
    * GET /api/billing/notices/recipients
    *
    * Who a failed-payment warning for this company would actually reach, and
    * which mailbox would carry it.
    *
    * This is the question the email settings page needs to answer on screen -
-   * "VeylOHR <billing@…> writes to Mario <mario@…>" - because the alternative
+   * "Veylo HR <billing@…> writes to Mario <mario@…>" - because the alternative
    * is an operator saving credentials and hoping. It resolves the recipients
    * exactly as the real alert does, so what is drawn is what would happen.
    */
