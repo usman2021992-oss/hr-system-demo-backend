@@ -6,6 +6,7 @@ import {
   PlatformEmailResult,
 } from '../../services/platformEmail.service';
 import { sendNotification } from '../notifications/notifications.service';
+import { taxCentsOnLines } from './tax';
 
 /**
  * What happens when a renewal fails.
@@ -85,9 +86,36 @@ function formatDateIt(d: Date | null): string {
   return d.toLocaleDateString('it-IT', { day: '2-digit', month: '2-digit', year: 'numeric' });
 }
 
+/**
+ * Italian money formatting: `€ 1.234,56`, not `€1234.56`.
+ *
+ * The emails are written in Italian and read by Italian customers, so an
+ * English decimal point in the one number that matters reads as a mistake in
+ * the invoice.
+ */
 function formatMoney(cents: number | null | undefined, currency: string): string {
-  const amount = ((cents ?? 0) / 100).toFixed(2);
-  return currency === 'EUR' ? `€${amount}` : `${currency} ${amount}`;
+  const amount = (cents ?? 0) / 100;
+  const formatted = amount.toLocaleString('it-IT', {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  });
+  return currency === 'EUR' ? `€ ${formatted}` : `${formatted} ${currency}`;
+}
+
+/** The delivery outcome in Italian, for the copy that goes to the operator. */
+function describeStatusIt(status: NoticeChannelStatus): string {
+  switch (status) {
+    case 'sent':
+      return 'inviata';
+    case 'skipped':
+      return 'non inviata (casella non configurata)';
+    case 'failed':
+      return 'invio fallito';
+    case 'no_recipient':
+      return 'nessun destinatario';
+    default:
+      return status;
+  }
 }
 
 /** Turns the mailer's result into the status stored on the transaction. */
@@ -202,6 +230,14 @@ export interface PaymentFailedNotice {
   graceDays: number;
   failureMessage?: string | null;
   /**
+   * The payment is waiting on a 3D Secure confirmation rather than having been
+   * refused. Same deadline, entirely different instruction: there is nothing
+   * wrong with the card, somebody just has to approve the charge.
+   */
+  requiresAction?: boolean;
+  /** Where that confirmation is completed. */
+  actionUrl?: string | null;
+  /**
    * A rehearsal: identical recipients, wording and transport, marked as a test
    * so nobody mistakes it for a real dunning notice. Used by the "send a test"
    * button so the whole path can be proved before a live customer depends on it.
@@ -259,10 +295,14 @@ export async function sendPaymentFailedNotices(
   // ---------------------------------------------------------------------
   const inAppTitle = notice.isTest
     ? 'Prova: avviso di pagamento non riuscito'
-    : 'Pagamento non riuscito';
+    : notice.requiresAction
+      ? 'Conferma richiesta per il pagamento'
+      : 'Pagamento non riuscito';
   const inAppMessage = notice.isTest
     ? `Messaggio di prova. In un caso reale l'accesso verrebbe sospeso il ${deadline}.`
-    : `Il rinnovo dell'abbonamento non è andato a buon fine. Regolarizza il pagamento entro il ${deadline} per non perdere l'accesso.`;
+    : notice.requiresAction
+      ? `Il rinnovo richiede la conferma 3D Secure della tua banca. Completala entro il ${deadline} per non perdere l'accesso.`
+      : `Il rinnovo dell'abbonamento non è andato a buon fine. Regolarizza il pagamento entro il ${deadline} per non perdere l'accesso.`;
 
   for (const userId of recipients.inAppUserIds) {
     try {
@@ -311,27 +351,52 @@ export async function sendPaymentFailedNotices(
       `[Billing] Payment failed for company ${notice.companyId} but no owner or admin address could be resolved.`
     );
   } else {
+    // A 3D Secure hold and a decline share a deadline and nothing else. One
+    // asks the customer to approve a charge their bank is holding; the other
+    // asks them to fix a payment method. Sending the wrong one costs them a
+    // call to their bank about a card that was never refused.
+    const reasonLine = notice.failureMessage
+      ? `<p>Motivo: ${notice.failureMessage}</p>`
+      : '';
+    const reasonLineText = notice.failureMessage ? `Motivo: ${notice.failureMessage}\n\n` : '';
+
+    // The 3D Secure link is the whole point of that email, so it leads; for a
+    // decline the billing page is where a card gets replaced.
+    const actionHref = notice.requiresAction && notice.actionUrl ? notice.actionUrl : billingUrl;
+    const actionLabel = notice.requiresAction
+      ? 'Completa la conferma del pagamento'
+      : 'Aggiorna il metodo di pagamento';
+
     const html =
       testNoteHtml +
       `<p>Gentile ${owner.name},</p>` +
-      `<p>Il rinnovo automatico dell'abbonamento VeylOHR per <strong>${notice.companyName}</strong> ` +
-      `non &egrave; andato a buon fine${notice.amountCents ? ` (importo: <strong>${amount}</strong>)` : ''}.</p>` +
-      `<p>Per non interrompere il servizio &egrave; necessario regolarizzare il pagamento ` +
+      (notice.requiresAction
+        ? `<p>Il rinnovo dell'abbonamento Veylo HR per <strong>${notice.companyName}</strong> ` +
+          `&egrave; in attesa della tua conferma 3D Secure` +
+          `${notice.amountCents ? ` (importo: <strong>${amount}</strong>)` : ''}. ` +
+          `La carta non &egrave; stata rifiutata: la banca richiede la tua approvazione per completare l'addebito.</p>`
+        : `<p>Il rinnovo automatico dell'abbonamento Veylo HR per <strong>${notice.companyName}</strong> ` +
+          `non &egrave; andato a buon fine${notice.amountCents ? ` (importo: <strong>${amount}</strong>)` : ''}.</p>`) +
+      reasonLine +
+      `<p>Per non interrompere il servizio &egrave; necessario completare il pagamento ` +
       `<strong>entro il ${deadline}</strong>. Dopo tale data l'accesso alla piattaforma sar&agrave; sospeso.</p>` +
-      `<p>Puoi aggiornare il metodo di pagamento e completare il pagamento da qui:<br>` +
-      `<a href="${billingUrl}">${billingUrl}</a></p>` +
-      `<p>Se il pagamento &egrave; gi&agrave; stato effettuato puoi ignorare questo messaggio.</p>` +
-      `<p>Cordiali saluti,<br>Team VeylOHR</p>`;
+      `<p>${actionLabel}:<br><a href="${actionHref}">${actionHref}</a></p>` +
+      `<p>Se il pagamento &egrave; gi&agrave; stato completato puoi ignorare questo messaggio.</p>` +
+      `<p>Cordiali saluti,<br>Team Veylo HR</p>`;
 
     const text =
       testNoteText +
       `Gentile ${owner.name},\n\n` +
-      `Il rinnovo automatico dell'abbonamento VeylOHR per ${notice.companyName} non e' andato a buon fine${amountLine}.\n\n` +
-      `Per non interrompere il servizio e' necessario regolarizzare il pagamento entro il ${deadline}. ` +
+      (notice.requiresAction
+        ? `Il rinnovo dell'abbonamento Veylo HR per ${notice.companyName} e' in attesa della tua conferma 3D Secure${amountLine}. ` +
+          `La carta non e' stata rifiutata: la banca richiede la tua approvazione per completare l'addebito.\n\n`
+        : `Il rinnovo automatico dell'abbonamento Veylo HR per ${notice.companyName} non e' andato a buon fine${amountLine}.\n\n`) +
+      reasonLineText +
+      `Per non interrompere il servizio e' necessario completare il pagamento entro il ${deadline}. ` +
       `Dopo tale data l'accesso alla piattaforma sara' sospeso.\n\n` +
-      `Aggiorna il metodo di pagamento qui: ${billingUrl}\n\n` +
-      `Se il pagamento e' gia' stato effettuato puoi ignorare questo messaggio.\n\n` +
-      `Cordiali saluti,\nTeam VeylOHR`;
+      `${actionLabel}: ${actionHref}\n\n` +
+      `Se il pagamento e' gia' stato completato puoi ignorare questo messaggio.\n\n` +
+      `Cordiali saluti,\nTeam Veylo HR`;
 
     // The owner is the addressee; the generic company mailbox is copied only
     // when it is a different address, so nobody receives the same mail twice.
@@ -349,7 +414,9 @@ export async function sendPaymentFailedNotices(
       const result = await sendPlatformEmail(
         {
           to,
-          subject: `${testTag}Pagamento non riuscito - azione richiesta entro il ${deadline} (${notice.companyName})`,
+          subject: notice.requiresAction
+          ? `${testTag}Conferma il pagamento entro il ${deadline} (${notice.companyName})`
+          : `${testTag}Pagamento non riuscito - azione richiesta entro il ${deadline} (${notice.companyName})`,
           html,
           text,
         },
@@ -385,7 +452,7 @@ export async function sendPaymentFailedNotices(
       ? `<p>Motivo riportato dal gateway: ${notice.failureMessage}</p>`
       : '';
     const ownerLine = owner
-      ? `Il titolare (${owner.email}) &egrave; stato avvisato via email (${delivery.ownerStatus}).`
+      ? `Il titolare (${owner.email}) &egrave; stato avvisato via email (${describeStatusIt(delivery.ownerStatus)}).`
       : 'ATTENZIONE: nessun indirizzo del titolare trovato, il cliente NON &egrave; stato avvisato via email.';
 
     // No company fallback here, deliberately. This message names a customer
@@ -417,7 +484,7 @@ export async function sendPaymentFailedNotices(
         `Accesso sospeso a partire dal: ${deadline}\n` +
         `Notifiche in-app inviate: ${delivery.inAppCount}\n` +
         (notice.failureMessage ? `Motivo: ${notice.failureMessage}\n` : '') +
-        `\n${owner ? `Titolare avvisato: ${owner.email} (${delivery.ownerStatus})` : 'ATTENZIONE: titolare NON avvisato via email.'}`,
+        `\n${owner ? `Titolare avvisato: ${owner.email} (${describeStatusIt(delivery.ownerStatus)})` : 'ATTENZIONE: titolare NON avvisato via email.'}`,
     }, null);
     delivery.copyStatus = statusOf(result);
   } catch (err: any) {
@@ -511,14 +578,19 @@ export async function sendPaymentFailedTestNotice(params: {
   const row = res.rows[0];
 
   const graceDays = params.graceDays ?? row.grace_period_days ?? 3;
-  // A realistic amount when there is a subscription, so the test mail reads
-  // like the real one rather than showing a placeholder figure.
+
+  // The real notice quotes what the provider tried to collect, which includes
+  // VAT. A test that quoted the net figure showed a different amount from the
+  // thing it is meant to rehearse, which defeats the purpose of rehearsing it.
+  const seatCents = Math.round(
+    (row.seat_quantity ?? 0) * parseFloat(row.unit_price_employee ?? '0') * 100
+  );
+  const deviceCents = Math.round(
+    (row.device_quantity ?? 0) * parseFloat(row.unit_price_device ?? '0') * 100
+  );
+  const netCents = seatCents + deviceCents;
   const amountCents = row.seat_quantity
-    ? Math.round(
-        (row.seat_quantity * parseFloat(row.unit_price_employee ?? '0') +
-          row.device_quantity * parseFloat(row.unit_price_device ?? '0')) *
-          100
-      )
+    ? netCents + taxCentsOnLines([seatCents, deviceCents])
     : null;
 
   const delivery = await sendPaymentFailedNotices({

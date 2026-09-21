@@ -85,6 +85,11 @@ const updateCompanySchema = z.object({
   discount_valid_to: z.string().nullable().optional(),
   bill_reminder_days_before: z.number().int().min(1).max(30).nullable().optional(),
   grace_period_days: z.number().int().min(0).max(30).nullable().optional(),
+  // The controller has always read and written this, but neither schema
+  // named it - and an object schema drops what it does not name, so the
+  // "mandatory subscription" toggle reported success and saved nothing.
+  // Both shapes are accepted: the client sends a boolean, form encoding a string.
+  billing_enforced: z.union([z.boolean(), z.string()]).nullable().optional(),
   vat_number: vatNumberField(),
   sdi_recipient_code: sdiRecipientCodeField(),
   pec_email: pecEmailField(),
@@ -114,6 +119,11 @@ const createCompanySchema = z.object({
   discount_valid_to: z.string().nullable().optional(),
   bill_reminder_days_before: z.number().int().min(1).max(30).nullable().optional(),
   grace_period_days: z.number().int().min(0).max(30).nullable().optional(),
+  // The controller has always read and written this, but neither schema
+  // named it - and an object schema drops what it does not name, so the
+  // "mandatory subscription" toggle reported success and saved nothing.
+  // Both shapes are accepted: the client sends a boolean, form encoding a string.
+  billing_enforced: z.union([z.boolean(), z.string()]).nullable().optional(),
   vat_number: vatNumberField(),
   sdi_recipient_code: sdiRecipientCodeField(),
   pec_email: pecEmailField(),

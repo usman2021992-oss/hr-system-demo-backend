@@ -579,7 +579,21 @@ export class SubscriptionService {
         [sub.id, activationKey]
       );
 
-      if (existingTx.rowCount === 0) {
+      // PayPal announces the subscription and the money separately, and its
+      // activation event carries neither a payment id nor an amount. Writing a
+      // row from it produced a duplicate: this one keyed on the activation
+      // event id and priced from seats x rate (so without VAT), and then a
+      // second from PAYMENT.SALE.COMPLETED, which could not match it and
+      // recorded the real charge again as a renewal.
+      //
+      // So PayPal records nothing here. The sale event writes the single row
+      // and labels it 'activation' when it is the first payment of the
+      // subscription. Stripe is unaffected: its checkout session carries the
+      // invoice id and the real total, and the invoice webhook that follows
+      // matches on that id rather than duplicating.
+      const providerReportsPaymentSeparately = event.provider === 'paypal';
+
+      if (existingTx.rowCount === 0 && !providerReportsPaymentSeparately) {
         await client.query(
           `INSERT INTO billing_transactions (
             company_id, subscription_id, provider,
@@ -894,6 +908,30 @@ export class SubscriptionService {
               100
           );
 
+        // The first money a subscription ever takes is its activation, not a
+        // renewal - and for PayPal this is the only row that will exist for
+        // it, because the activation event writes none. Decided by looking for
+        // an earlier settled payment rather than by trusting the event type,
+        // so a replayed or out-of-order webhook cannot mint a second
+        // activation.
+        const earlierPayment = await client.query(
+          `SELECT 1 FROM billing_transactions
+            WHERE subscription_id = $1
+              AND status IN ('paid', 'pending')
+              AND kind IN ('activation', 'renewal', 'license_upgrade', 'carried_over')
+            LIMIT 1`,
+          [sub.id]
+        );
+        const isFirstPayment = earlierPayment.rowCount === 0;
+
+        const paymentKind = collectedNothing
+          ? 'carried_over'
+          : hasPendingUpgrade
+            ? 'license_upgrade'
+            : isFirstPayment
+              ? 'activation'
+              : 'renewal';
+
         await client.query(
           `INSERT INTO billing_transactions (
             company_id, subscription_id, provider,
@@ -915,13 +953,15 @@ export class SubscriptionService {
             event.currency || sub.currency,
             hasPendingUpgrade
               ? `Licenze aggiuntive: ${nextSeatQty} dipendenti, ${nextDevQty} terminali`
-              : `Rinnovo mensile: ${nextSeatQty} dipendenti, ${nextDevQty} terminali`,
+              : isFirstPayment
+                ? `Attivazione abbonamento: ${nextSeatQty} dipendenti, ${nextDevQty} terminali`
+                : `Rinnovo mensile: ${nextSeatQty} dipendenti, ${nextDevQty} terminali`,
             nextSeatQty,
             nextDevQty,
             Math.round(parseFloat(sub.unit_price_employee) * 100),
             Math.round(parseFloat(sub.unit_price_device) * 100),
             event.invoiceUrl || null,
-            collectedNothing ? 'carried_over' : hasPendingUpgrade ? 'license_upgrade' : 'renewal',
+            paymentKind,
             collectedNothing ? 'pending' : 'paid',
             periodStart,
             periodEnd,
@@ -1045,6 +1085,8 @@ export class SubscriptionService {
         gracePeriodEndsAt: deadline,
         graceDays,
         failureMessage: event.failureMessage ?? null,
+        requiresAction: event.requiresAction === true,
+        actionUrl: event.actionUrl ?? null,
       });
 
       await recordNoticeDelivery(failureRow.rows[0]?.id, delivery);

@@ -100,6 +100,11 @@ export class WebhookController {
 
         // Payment Failed
         case 'invoice.payment_failed':
+        // Nothing was collected and the grace period has to start, so this
+        // takes the same path as a decline. The event carries a flag that
+        // changes the wording and adds the link that completes the 3D Secure
+        // confirmation - the customer's card is fine, it just needs them.
+        case 'invoice.payment_action_required':
         case 'BILLING.SUBSCRIPTION.PAYMENT.FAILED':
         case 'BILLING.SUBSCRIPTION.SUSPENDED':
           await subscriptionService.handlePaymentFailed(parsedEvent);

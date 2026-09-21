@@ -654,6 +654,12 @@ export class StripeGateway implements IPaymentGateway {
             : session.customer?.id;
         parsed.status = 'active';
         parsed.amountCents = session.amount_total ?? undefined;
+        // The session already carries the split Stripe charged, so the
+        // activation receipt shows subtotal, VAT and total like every renewal
+        // does. Without these the first payment - the one the customer looks
+        // at most closely - was the only one with no tax line.
+        parsed.subtotalCents = session.amount_subtotal ?? undefined;
+        parsed.taxCents = session.total_details?.amount_tax ?? undefined;
         parsed.currency = session.currency?.toUpperCase();
 
         // The checkout session itself carries no receipt link, so fetch the
@@ -746,6 +752,28 @@ export class StripeGateway implements IPaymentGateway {
         break;
       }
 
+      // A renewal held up by a 3D Secure challenge. Stripe has not taken the
+      // money and will expire the invoice if nobody completes it, so it is
+      // routed to the same handler as a failure - the grace period has to
+      // start either way - carrying a flag that changes what the customer is
+      // told and gives them the link that finishes the job.
+      case 'invoice.payment_action_required': {
+        const invoice = event.data.object as any;
+        parsed.subscriptionId = this.resolveInvoiceSubscriptionId(invoice);
+        parsed.providerInvoiceId = invoice.id;
+        parsed.customerId =
+          typeof invoice.customer === 'string' ? invoice.customer : invoice.customer?.id;
+        parsed.amountCents =
+          invoice.amount_due ?? invoice.amount_remaining ?? invoice.total ?? undefined;
+        parsed.currency = invoice.currency?.toUpperCase();
+        parsed.status = 'past_due';
+        parsed.requiresAction = true;
+        parsed.actionUrl = invoice.hosted_invoice_url || undefined;
+        parsed.failureCode = 'authentication_required';
+        parsed.failureMessage = await this.describeInvoiceDecline(invoice);
+        break;
+      }
+
       case 'invoice.payment_failed': {
         const invoice = event.data.object as any;
         parsed.subscriptionId = this.resolveInvoiceSubscriptionId(invoice);
@@ -760,10 +788,14 @@ export class StripeGateway implements IPaymentGateway {
           invoice.amount_due ?? invoice.amount_remaining ?? invoice.total ?? undefined;
         parsed.currency = invoice.currency?.toUpperCase();
         parsed.status = 'past_due';
-        parsed.failureCode = (invoice.last_finalization_error as any)?.code || 'payment_failed';
-        parsed.failureMessage =
-          (invoice.last_finalization_error as any)?.message ||
-          'Payment attempt failed on card';
+        // The real reason a card was refused lives on the PaymentIntent, not
+        // on the invoice: `last_finalization_error` describes a problem
+        // building the invoice, and is empty for every ordinary decline - which
+        // is why this used to read "Payment attempt failed on card" no matter
+        // what the bank actually said.
+        const declineCode = await this.resolveInvoiceDeclineCode(invoice);
+        parsed.failureCode = declineCode ?? 'payment_failed';
+        parsed.failureMessage = await this.describeInvoiceDecline(invoice);
         break;
       }
     }
@@ -866,6 +898,84 @@ export class StripeGateway implements IPaymentGateway {
       if (err?.statusCode === 404 || err?.code === 'resource_missing') return null;
       throw err;
     }
+  }
+
+  /**
+   * The PaymentIntent behind an invoice, when there is one.
+   *
+   * Every decline detail lives here rather than on the invoice, so both
+   * helpers below need it. Best effort: a webhook must not fail because a
+   * follow-up read did.
+   */
+  private async retrieveInvoicePaymentIntent(invoice: any): Promise<any | null> {
+    try {
+      const pi = invoice?.payment_intent;
+      if (!pi) return null;
+      if (typeof pi !== 'string') return pi;
+      return await this.stripe.paymentIntents.retrieve(pi);
+    } catch (err: any) {
+      console.warn(
+        '[Stripe] Could not read the payment intent behind an invoice:',
+        err?.message || err
+      );
+      return null;
+    }
+  }
+
+  /** Stripe's own decline code, e.g. `expired_card`, `insufficient_funds`. */
+  private async resolveInvoiceDeclineCode(invoice: any): Promise<string | null> {
+    const intent = await this.retrieveInvoicePaymentIntent(invoice);
+    const err = intent?.last_payment_error;
+    if (!err) return null;
+    // `decline_code` is the bank's reason and the more specific of the two;
+    // `code` is Stripe's category and is always present when there is an error.
+    return err.decline_code || err.code || null;
+  }
+
+  /**
+   * Why the payment did not go through, in Italian, for the customer.
+   *
+   * The four cases below are the ones that actually happen and that the
+   * customer can act on - each needs a different action from them, which is
+   * the whole reason for not showing one generic sentence. Anything else falls
+   * back to Stripe's own message rather than to a vaguer translation of it.
+   */
+  private async describeInvoiceDecline(invoice: any): Promise<string> {
+    const intent = await this.retrieveInvoicePaymentIntent(invoice);
+    const err = intent?.last_payment_error;
+    const code = err?.decline_code || err?.code || null;
+
+    switch (code) {
+      case 'authentication_required':
+        return 'Il pagamento richiede la conferma 3D Secure da parte del titolare della carta.';
+      case 'expired_card':
+        return 'La carta è scaduta.';
+      case 'insufficient_funds':
+        return 'Fondi insufficienti sulla carta.';
+      case 'card_declined':
+      case 'generic_decline':
+      case 'do_not_honor':
+      case 'transaction_not_allowed':
+        return 'La carta è stata rifiutata dalla banca emittente.';
+      case 'incorrect_cvc':
+      case 'invalid_cvc':
+        return 'Il codice di sicurezza (CVC) della carta non è corretto.';
+      case 'lost_card':
+      case 'stolen_card':
+        return 'La carta risulta bloccata dalla banca emittente.';
+      case 'processing_error':
+        return 'Errore temporaneo durante l’elaborazione del pagamento.';
+      default:
+        break;
+    }
+
+    // An invoice that never got as far as a payment attempt fails at
+    // finalization instead, and that error is the useful one in that case.
+    return (
+      err?.message ||
+      invoice?.last_finalization_error?.message ||
+      'Il pagamento non è andato a buon fine.'
+    );
   }
 
   private mapStripeStatus(status: Stripe.Subscription.Status): SubscriptionStatus {

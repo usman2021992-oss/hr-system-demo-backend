@@ -89,6 +89,19 @@ export interface ParsedWebhookEvent {
   providerInvoiceId?: string;
   failureCode?: string;
   failureMessage?: string;
+  /**
+   * The money was not refused - it is waiting for the cardholder to confirm.
+   *
+   * European cards fall under SCA, so a renewal can stop on a 3D Secure
+   * challenge that only the customer can complete. It has to be treated as a
+   * failure, because nothing has been collected and the clock is running, but
+   * it must not be *worded* as one: telling somebody their card was declined
+   * when it was not sends them to their bank instead of to the link that
+   * actually finishes the payment.
+   */
+  requiresAction?: boolean;
+  /** Where the customer completes that confirmation. */
+  actionUrl?: string;
   currentPeriodStart?: Date;
   currentPeriodEnd?: Date;
 }
