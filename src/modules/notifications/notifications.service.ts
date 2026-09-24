@@ -36,6 +36,8 @@ export type NotificationEventType =
   | 'onboarding.task_reminder'
   /** A renewal charge was declined and the grace period has started. */
   | 'billing.payment_failed'
+  /** A scheduled licence reduction could not be applied in full: usage is higher. */
+  | 'billing.reduction_capped'
   | 'manager.alert';
 
 export type NotificationCategory =
