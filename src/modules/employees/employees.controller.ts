@@ -1258,7 +1258,7 @@ export const deactivateEmployee = asyncHandler(async (req: Request, res: Respons
   const employee = await queryOne(
     `UPDATE users SET status = 'inactive', termination_date = CURRENT_DATE, updated_at = NOW()
      WHERE id = $1 AND company_id = ANY($2) AND status = 'active'
-     RETURNING id, name, surname, email, role, status, termination_date`,
+     RETURNING id, company_id, name, surname, email, role, status, termination_date`,
     [empId, allowedCompanyIds],
   );
 
@@ -1373,6 +1373,25 @@ export const activateEmployee = asyncHandler(async (req: Request, res: Response)
 
   const allowedCompanyIds = await resolveAllowedCompanyIds(req.user!);
 
+  // Read the row first: someone coming back from inactive takes a license again,
+  // exactly like a new hire. Without this, deactivating and reactivating is a
+  // way to keep more people active than the company pays for.
+  const target = await queryOne<{ id: number; company_id: number; role: string }>(
+    `SELECT id, company_id, role FROM users
+     WHERE id = $1 AND company_id = ANY($2) AND status = 'inactive'`,
+    [empId, allowedCompanyIds],
+  );
+  if (!target) {
+    notFound(res, 'Dipendente non trovato o già attivo');
+    return;
+  }
+
+  await assertLicenseCapacity(
+    target.company_id,
+    target.role === 'store_terminal' ? 'terminal' : 'employee',
+    1,
+  );
+
   const employee = await queryOne(
     `UPDATE users SET status = 'active', termination_date = NULL, updated_at = NOW()
      WHERE id = $1 AND company_id = ANY($2) AND status = 'inactive'
@@ -1385,8 +1404,8 @@ export const activateEmployee = asyncHandler(async (req: Request, res: Response)
     return;
   }
   void recordHeadcountEvent({
-    companyId: (employee as any).company_id ?? req.user!.companyId!,
-    resourceType: (employee as any).role === 'store_terminal' ? 'terminal' : 'employee',
+    companyId: target.company_id,
+    resourceType: target.role === 'store_terminal' ? 'terminal' : 'employee',
     changeType: 'added',
     userId: (employee as any).id,
     userLabel: [(employee as any).name, (employee as any).surname].filter(Boolean).join(' '),
