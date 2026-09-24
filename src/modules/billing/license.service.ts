@@ -160,6 +160,59 @@ export async function assertLicenseCapacity(
   }
 }
 
+export interface ReductionFloorResult {
+  /** What the licenses become now. */
+  seats: number;
+  devices: number;
+  /** True when usage kept the reduction from reaching the number asked for. */
+  seatsCapped: boolean;
+  devicesCapped: boolean;
+  /** The target to keep waiting for, or null once it has been reached. */
+  keepPendingSeats: number | null;
+  keepPendingDevices: number | null;
+}
+
+/**
+ * How far a scheduled reduction may actually go, applied at the moment it lands.
+ *
+ * The request was checked against usage when the admin made it, but usage moves
+ * in between: deactivate 3, ask to drop 10 -> 7, then hire 3 again, and the
+ * reduction would leave 10 active people on 7 licenses. So the live counts are
+ * the floor here, and what was already paid for is the ceiling — this never
+ * grants a license nobody paid for.
+ *
+ * A reduction that cannot be reached is not thrown away: the remainder stays
+ * pending and applies by itself at a later renewal, once the counts have come
+ * down.
+ */
+export function applyReductionFloor(params: {
+  currentSeats: number;
+  currentDevices: number;
+  requestedSeats: number | null;
+  requestedDevices: number | null;
+  inUseEmployees: number;
+  inUseTerminals: number;
+}): ReductionFloorResult {
+  const resolve = (current: number, requested: number | null, inUse: number) => {
+    if (requested === null) return { value: current, capped: false, keepPending: null as number | null };
+    const value = Math.min(current, Math.max(requested, inUse));
+    const capped = value > requested;
+    return { value, capped, keepPending: capped ? requested : null };
+  };
+
+  const seats = resolve(params.currentSeats, params.requestedSeats, params.inUseEmployees);
+  const devices = resolve(params.currentDevices, params.requestedDevices, params.inUseTerminals);
+
+  return {
+    seats: seats.value,
+    devices: devices.value,
+    seatsCapped: seats.capped,
+    devicesCapped: devices.capped,
+    keepPendingSeats: seats.keepPending,
+    keepPendingDevices: devices.keepPending,
+  };
+}
+
 /**
  * Prices a change in licenses.
  *

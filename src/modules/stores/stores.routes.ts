@@ -14,7 +14,14 @@ import {
 import { authenticate, requireRole, enforceCompany, requireModulePermission } from '../../middleware/auth';
 import { validate } from '../../middleware/validate';
 import { auditLog } from '../../middleware/auditLog';
-import { deleteStoreLogo, storeLogoUploadMiddleware, uploadStoreLogo } from './logo.controller';
+import {
+  deleteStoreLogo,
+  storeLogoUploadMiddleware,
+  uploadStoreLogo,
+  deleteStoreBanner,
+  storeBannerUploadMiddleware,
+  uploadStoreBanner,
+} from './logo.controller';
 
 const router = Router();
 
@@ -63,6 +70,8 @@ router.put('/:id', authenticate, requireRole(...storeWriters), enforceCompany, r
 router.put('/:id/operating-hours', authenticate, requireRole(...storeWriters), enforceCompany, requireModulePermission('negozi', 'write'), validate(storeHoursSchema), auditLog('store'), updateStoreOperatingHours);
 router.post('/:id/logo', authenticate, requireRole(...storeWriters), enforceCompany, requireModulePermission('negozi', 'write'), storeLogoUploadMiddleware, auditLog('store'), uploadStoreLogo);
 router.delete('/:id/logo', authenticate, requireRole(...storeWriters), enforceCompany, requireModulePermission('negozi', 'write'), auditLog('store'), deleteStoreLogo);
+router.post('/:id/banner', authenticate, requireRole(...storeWriters), enforceCompany, requireModulePermission('negozi', 'write'), storeBannerUploadMiddleware, auditLog('store'), uploadStoreBanner);
+router.delete('/:id/banner', authenticate, requireRole(...storeWriters), enforceCompany, requireModulePermission('negozi', 'write'), auditLog('store'), deleteStoreBanner);
 router.delete('/:id/permanent', authenticate, requireRole(...storeWriters), enforceCompany, requireModulePermission('negozi', 'write'), auditLog('store'), deleteStorePermanent);
 router.delete('/:id', authenticate, requireRole(...storeWriters), enforceCompany, requireModulePermission('negozi', 'write'), auditLog('store'), deactivateStore);
 router.patch('/:id/activate', authenticate, requireRole(...storeWriters), enforceCompany, requireModulePermission('negozi', 'write'), auditLog('store'), activateStore);

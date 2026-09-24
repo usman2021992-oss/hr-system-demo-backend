@@ -176,7 +176,9 @@ app.get('/uploads/avatars/:filename', (req, res, next) => {
 
 app.get('/uploads/company-logos/:filename', (req, res) => {
   const { filename } = req.params;
-  const match = /^company-(\d+)\.[a-zA-Z0-9]+$/.exec(filename);
+  // The optional "-<timestamp>" is how uploads are named now, so a replaced
+  // image is never served from cache; the plain form is what older files use.
+  const match = /^company-(\d+)(?:-\d+)?\.[a-zA-Z0-9]+$/.exec(filename);
   if (!match) {
     res.status(400).end();
     return;
@@ -199,7 +201,7 @@ app.get('/uploads/company-logos/:filename', (req, res) => {
 
 app.get('/uploads/company-banners/:filename', (req, res) => {
   const { filename } = req.params;
-  const match = /^company-banner-(\d+)\.[a-zA-Z0-9]+$/.exec(filename);
+  const match = /^company-banner-(\d+)(?:-\d+)?\.[a-zA-Z0-9]+$/.exec(filename);
   if (!match) {
     res.status(400).end();
     return;
@@ -299,7 +301,7 @@ app.get('/uploads/public-avatars/:filename', async (req, res) => {
 
 app.get('/uploads/public-store-logos/:filename', async (req, res) => {
   const { filename } = req.params;
-  const match = /^store-(\d+)\.[a-zA-Z0-9]+$/.exec(filename);
+  const match = /^store-(\d+)(?:-\d+)?\.[a-zA-Z0-9]+$/.exec(filename);
   if (!match) {
     res.status(400).end();
     return;
@@ -353,7 +355,7 @@ app.get('/uploads/store-logos/:filename', (req, res, next) => {
   next();
 }, authenticate, async (req, res) => {
   const { filename } = req.params;
-  const match = /^store-(\d+)\.[a-zA-Z0-9]+$/.exec(filename);
+  const match = /^store-(\d+)(?:-\d+)?\.[a-zA-Z0-9]+$/.exec(filename);
   if (!match) {
     res.status(400).end();
     return;
@@ -387,6 +389,51 @@ app.get('/uploads/store-logos/:filename', (req, res, next) => {
   if (contentType) res.setHeader('Content-Type', contentType);
 
   const filePath = path.join(uploadsRoot, 'store-logos', filename);
+  res.sendFile(filePath, (err) => { if (err) res.status(404).end(); });
+});
+
+// Store banners, scoped exactly like store logos above.
+app.get('/uploads/store-banners/:filename', (req, res, next) => {
+  if (req.query.token && !req.headers.authorization) {
+    req.headers.authorization = `Bearer ${req.query.token}`;
+  }
+  next();
+}, authenticate, async (req, res) => {
+  const { filename } = req.params;
+  const match = /^store-banner-(\d+)(?:-\d+)?\.[a-zA-Z0-9]+$/.exec(filename);
+  if (!match) {
+    res.status(400).end();
+    return;
+  }
+
+  const storeId = parseInt(match[1], 10);
+  if (!Number.isFinite(storeId)) {
+    res.status(404).end();
+    return;
+  }
+
+  const store = await queryOne<{ company_id: number }>(
+    `SELECT company_id FROM stores WHERE id = $1`,
+    [storeId],
+  );
+  const allowedCompanyIds = await resolveAllowedCompanyIds(req.user!);
+  if (!store || !allowedCompanyIds.includes(store.company_id)) {
+    res.status(403).end();
+    return;
+  }
+
+  const ext = path.extname(filename).toLowerCase();
+  const mimeTypes: Record<string, string> = {
+    '.jpg': 'image/jpeg',
+    '.jpeg': 'image/jpeg',
+    '.png': 'image/png',
+    '.gif': 'image/gif',
+    '.webp': 'image/webp',
+  };
+  const contentType = mimeTypes[ext];
+  if (contentType) res.setHeader('Content-Type', contentType);
+
+  const filePath = path.join(uploadsRoot, 'store-banners', filename);
   res.sendFile(filePath, (err) => { if (err) res.status(404).end(); });
 });
 

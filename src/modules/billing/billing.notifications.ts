@@ -543,6 +543,176 @@ export async function recordNoticeDelivery(
   }
 }
 
+export interface ReductionCappedNotice {
+  companyId: number;
+  companyName: string;
+  /** What the admin asked to go down to. */
+  requestedSeats: number | null;
+  requestedDevices: number | null;
+  /** What the licences actually became, held up by live usage. */
+  appliedSeats: number;
+  appliedDevices: number;
+  /** Why it could not go lower. */
+  inUseEmployees: number;
+  inUseTerminals: number;
+}
+
+/**
+ * Tells everyone that a scheduled licence reduction could not be applied in full.
+ *
+ * The customer asked to pay for less and is still paying for more, so silence
+ * is the one unacceptable option: they would find out from the invoice. The
+ * operator is copied because it is a billing discrepancy they may be asked
+ * about. The request itself stays pending and applies on its own once the
+ * counts come down, and the message says so.
+ *
+ * Never throws — a renewal must not fail because a mail server is down.
+ */
+export async function sendLicenseReductionCappedNotice(
+  notice: ReductionCappedNotice
+): Promise<void> {
+  const billingUrl = `${appBaseUrl()}/impostazioni/fatturazione`;
+
+  const lines: string[] = [];
+  if (notice.requestedSeats !== null && notice.appliedSeats > notice.requestedSeats) {
+    lines.push(
+      `Dipendenti: richiesta una riduzione a ${notice.requestedSeats} licenze, ma ${notice.inUseEmployees} dipendenti sono attivi. Le licenze restano ${notice.appliedSeats}.`
+    );
+  }
+  if (notice.requestedDevices !== null && notice.appliedDevices > notice.requestedDevices) {
+    lines.push(
+      `Terminali: richiesta una riduzione a ${notice.requestedDevices} licenze, ma ${notice.inUseTerminals} terminali sono attivi. Le licenze restano ${notice.appliedDevices}.`
+    );
+  }
+  if (lines.length === 0) return;
+
+  const brand = await getEmailBrand();
+
+  let recipients: FailureRecipients = { owner: null, companyEmail: null, inAppUserIds: [] };
+  try {
+    recipients = await resolveFailureRecipients(notice.companyId);
+  } catch (err: any) {
+    console.error(`[Billing] Capped-reduction notice: could not resolve recipients: ${err?.message || err}`);
+  }
+
+  // 1. In-app, the channel that cannot bounce.
+  for (const userId of recipients.inAppUserIds) {
+    try {
+      await sendNotification({
+        companyId: notice.companyId,
+        userId,
+        type: 'billing.reduction_capped',
+        title: 'Riduzione licenze non applicata del tutto',
+        message: `${lines.join(' ')} La richiesta resta attiva e verrà applicata da sola quando i conteggi scenderanno.`,
+        priority: 'high',
+        channels: ['in_app'],
+        skipSettingsCheck: true,
+        metadata: {
+          link: '/impostazioni/fatturazione',
+          requestedSeats: notice.requestedSeats,
+          requestedDevices: notice.requestedDevices,
+          appliedSeats: notice.appliedSeats,
+          appliedDevices: notice.appliedDevices,
+        },
+      });
+    } catch (err: any) {
+      console.error(
+        `[Billing] In-app capped-reduction alert failed for user ${userId}:`,
+        err?.message || err
+      );
+    }
+  }
+
+  const facts = [
+    { label: 'Azienda', value: notice.companyName },
+    { label: 'Licenze dipendenti', value: String(notice.appliedSeats) },
+    { label: 'Dipendenti attivi', value: String(notice.inUseEmployees) },
+    { label: 'Licenze terminali', value: String(notice.appliedDevices) },
+    { label: 'Terminali attivi', value: String(notice.inUseTerminals) },
+  ];
+
+  // 2. The owner's email.
+  const { owner, companyEmail } = recipients;
+  if (owner) {
+    const { html, text } = renderBillingEmail(
+      {
+        banner: { tone: 'warning', text: 'Riduzione licenze applicata solo in parte' },
+        greeting: `Gentile ${owner.name},`,
+        title: 'La riduzione delle licenze non è stata applicata del tutto',
+        paragraphs: [
+          'Al rinnovo abbiamo provato ad applicare la riduzione delle licenze che avevi richiesto, ma le licenze non possono scendere sotto il numero di dipendenti e terminali attivi.',
+          ...lines,
+          'La richiesta resta attiva: verrà applicata automaticamente al primo rinnovo utile, appena i conteggi lo consentiranno. Per applicarla subito, disattiva i dipendenti o i terminali che non servono più.',
+        ],
+        facts,
+        action: { label: 'Apri la pagina Fatturazione', url: billingUrl },
+      },
+      brand
+    );
+
+    const to =
+      companyEmail && companyEmail.toLowerCase() !== owner.email.toLowerCase()
+        ? `${owner.email}, ${companyEmail}`
+        : owner.email;
+
+    try {
+      await sendPlatformEmail(
+        {
+          to,
+          subject: `Riduzione licenze non applicata del tutto (${notice.companyName})`,
+          html,
+          text,
+        },
+        notice.companyId
+      );
+    } catch (err: any) {
+      console.error('[Billing] Capped-reduction email threw:', err?.message || err);
+    }
+  } else {
+    console.warn(
+      `[Billing] Reduction capped for company ${notice.companyId} but no owner or admin address could be resolved.`
+    );
+  }
+
+  // 3. The operator copy — this is a billing discrepancy on a live account.
+  const operators = await operatorRecipients();
+  if (operators.length === 0) return;
+
+  try {
+    const operatorMail = renderBillingEmail(
+      {
+        banner: { tone: 'warning', text: 'Riduzione licenze bloccata dall’utilizzo' },
+        title: `${notice.companyName}: riduzione licenze applicata solo in parte`,
+        paragraphs: [
+          owner
+            ? `Il titolare (${owner.email}) è stato avvisato.`
+            : 'ATTENZIONE: nessun indirizzo del titolare trovato, il cliente NON è stato avvisato via email.',
+          ...lines,
+          'La richiesta resta in attesa e verrà riprovata ai prossimi rinnovi.',
+        ],
+        facts,
+        signature: 'Notifica automatica',
+      },
+      brand
+    );
+
+    await sendPlatformEmail(
+      {
+        to: operators.join(', '),
+        subject: `[${brand.brandName}] Riduzione licenze bloccata - ${notice.companyName}`,
+        html: operatorMail.html,
+        text: operatorMail.text,
+      },
+      null
+    );
+  } catch (err: any) {
+    console.error(
+      '[Billing] Could not send the operator copy of a capped reduction:',
+      err?.message || err
+    );
+  }
+}
+
 /**
  * Rehearses the whole alert for a company, without touching its subscription.
  *

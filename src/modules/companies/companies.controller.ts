@@ -42,6 +42,10 @@ interface CompanyRow {
   discount_valid_to: string | null;
   store_count: number;
   employee_count: number;
+  /** Terminals paired to a device. */
+  active_devices_count: number;
+  /** Terminals that take a licence: every active one, paired or not. */
+  billable_terminals_count: number;
   created_at: string;
 }
 
@@ -169,7 +173,13 @@ const COMPANY_LIST_SELECT = `
     COALESCE(c.billing_enforced, false) AS billing_enforced,
     (SELECT COUNT(*) FROM stores s WHERE s.company_id = c.id AND s.is_active = true)::int AS store_count,
     (SELECT COUNT(*) FROM users u WHERE u.company_id = c.id AND u.status = 'active' AND u.role != 'store_terminal')::int AS employee_count,
+    -- Two different questions, deliberately both answered:
+    --   active_devices_count   - terminals actually paired to a device
+    --   billable_terminals_count - terminals that take a licence (every active
+    --                              one, whether paired yet or not). This is the
+    --                              number the invoice and the licence gate use.
     (SELECT COUNT(*) FROM users u WHERE u.company_id = c.id AND u.status = 'active' AND u.role = 'store_terminal' AND (u.registered_device_token IS NOT NULL OR u.registered_device_identifier IS NOT NULL))::int AS active_devices_count,
+    (SELECT COUNT(*) FROM users u WHERE u.company_id = c.id AND u.status = 'active' AND u.role = 'store_terminal')::int AS billable_terminals_count,
     (SELECT COUNT(*) FROM users u WHERE u.company_id = c.id AND u.status = 'active' AND u.role != 'store_terminal' AND (u.registered_device_token IS NOT NULL OR u.registered_device_identifier IS NOT NULL))::int AS employee_devices_count
   FROM companies c
   LEFT JOIN company_groups cg ON cg.id = c.group_id

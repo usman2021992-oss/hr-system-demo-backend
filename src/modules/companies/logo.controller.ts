@@ -28,13 +28,21 @@ const MIME_TO_EXT: Record<string, string> = {
   'image/webp': '.webp',
 };
 
+/**
+ * A new name for every upload, so a replaced image is never served from cache.
+ * The serving routes read the company id from the leading "company-<id>" and
+ * accept both this and the older fixed names, so images uploaded before this
+ * keep working untouched.
+ */
+function versionedName(prefix: string, id: string, mimetype: string): string {
+  const ext = MIME_TO_EXT[mimetype] ?? '.jpg';
+  const numericId = parseInt(id, 10);
+  return `${prefix}-${Number.isFinite(numericId) ? numericId : 'x'}-${Date.now()}${ext}`;
+}
+
 const storage = multer.diskStorage({
   destination: (_req, _file, cb) => cb(null, UPLOAD_DIR),
-  filename: (req, file, cb) => {
-    const companyId = req.params.id;
-    const ext = MIME_TO_EXT[file.mimetype] ?? '.jpg';
-    cb(null, `company-${companyId}${ext}`);
-  },
+  filename: (req, file, cb) => cb(null, versionedName('company', req.params.id, file.mimetype)),
 });
 
 const ALLOWED_MIME = ['image/jpeg', 'image/jpg', 'image/png', 'image/webp'];
@@ -53,11 +61,7 @@ const multerInstance = multer({
 
 const bannerStorage = multer.diskStorage({
   destination: (_req, _file, cb) => cb(null, BANNER_UPLOAD_DIR),
-  filename: (req, file, cb) => {
-    const companyId = req.params.id;
-    const ext = MIME_TO_EXT[file.mimetype] ?? '.jpg';
-    cb(null, `company-banner-${companyId}${ext}`);
-  },
+  filename: (req, file, cb) => cb(null, versionedName('company-banner', req.params.id, file.mimetype)),
 });
 
 const bannerMulterInstance = multer({
@@ -126,15 +130,17 @@ export const uploadCompanyLogo = asyncHandler(async (req: Request, res: Response
 
   const filename = req.file.filename;
 
-  if (company.logo_filename && company.logo_filename !== filename) {
-    const oldPath = path.join(UPLOAD_DIR, company.logo_filename);
-    try { fs.unlinkSync(oldPath); } catch { /* ignore */ }
-  }
-
   await query(
     `UPDATE companies SET logo_filename = $1 WHERE id = $2`,
     [filename, companyId],
   );
+
+  // Only once the new name is stored, so a failed update cannot leave the
+  // company pointing at a file that has just been deleted.
+  if (company.logo_filename && company.logo_filename !== filename) {
+    const oldPath = path.join(UPLOAD_DIR, company.logo_filename);
+    try { fs.unlinkSync(oldPath); } catch { /* ignore */ }
+  }
 
   ok(res, { logoUrl: `/uploads/company-logos/${filename}` }, 'Logo aziendale aggiornato');
 });
@@ -192,15 +198,16 @@ export const uploadCompanyBanner = asyncHandler(async (req: Request, res: Respon
 
   const filename = req.file.filename;
 
-  if (company.banner_filename && company.banner_filename !== filename) {
-    const oldPath = path.join(BANNER_UPLOAD_DIR, company.banner_filename);
-    try { fs.unlinkSync(oldPath); } catch { /* ignore */ }
-  }
-
   await query(
     `UPDATE companies SET banner_filename = $1 WHERE id = $2`,
     [filename, companyId],
   );
+
+  // As above: store the new name first, then drop the file it replaced.
+  if (company.banner_filename && company.banner_filename !== filename) {
+    const oldPath = path.join(BANNER_UPLOAD_DIR, company.banner_filename);
+    try { fs.unlinkSync(oldPath); } catch { /* ignore */ }
+  }
 
   ok(res, { bannerUrl: `/uploads/company-banners/${filename}` }, 'Banner aziendale aggiornato');
 });

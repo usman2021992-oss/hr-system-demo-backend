@@ -4,6 +4,8 @@ import { pool, query, queryOne } from '../../config/database';
 import { ok, created, notFound, conflict, forbidden, badRequest } from '../../utils/response';
 import { asyncHandler } from '../../utils/asyncHandler';
 import { resolveAllowedCompanyIds } from '../../utils/companyScope';
+import { assertLicenseCapacity } from '../billing/license.service';
+import { recordHeadcountEvent } from '../billing/headcount.service';
 import {
   DEFAULT_SHIFT_TIMEZONE,
   normalizeShiftTimezone,
@@ -17,6 +19,7 @@ interface StoreRow {
   group_name?: string | null;
   company_logo_filename?: string | null;
   logo_filename?: string | null;
+  banner_filename?: string | null;
   name: string;
   code: string;
   address: string | null;
@@ -383,6 +386,14 @@ export const createStore = asyncHandler(async (req: Request, res: Response) => {
     return;
   }
 
+  // A terminal created here is billable the moment it exists, exactly like one
+  // created from the Terminals page, so it goes through the same gate. Checked
+  // before the store is inserted: a store whose terminal cannot be created is
+  // refused whole rather than left half-made.
+  if (terminal?.email && terminal?.password) {
+    await assertLicenseCapacity(targetCompanyId, 'terminal', 1);
+  }
+
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -423,17 +434,31 @@ export const createStore = asyncHandler(async (req: Request, res: Response) => {
     const store = storeRes.rows[0];
 
     // Create terminal account if requested
+    let createdTerminalId: number | null = null;
     if (terminal?.email && terminal?.password) {
       const passwordHash = await bcrypt.hash(terminal.password, 12);
-      await client.query(
+      const terminalRes = await client.query(
         `INSERT INTO users (
            company_id, store_id, name, surname, email, password_hash, role, status, created_by, updated_by
-         ) VALUES ($1, $2, $3, $4, $5, $6, 'store_terminal', 'active', $7, $7)`,
+         ) VALUES ($1, $2, $3, $4, $5, $6, 'store_terminal', 'active', $7, $7) RETURNING id`,
         [targetCompanyId, store.id, store.name, 'Terminale', terminal.email, passwordHash, req.user!.userId]
       );
+      createdTerminalId = terminalRes.rows[0].id;
     }
 
     await client.query('COMMIT');
+
+    // Billing ledger: this terminal now counts towards the billed headcount.
+    if (createdTerminalId !== null) {
+      void recordHeadcountEvent({
+        companyId: targetCompanyId,
+        resourceType: 'terminal',
+        changeType: 'added',
+        userId: createdTerminalId,
+        userLabel: `${store.name} - Terminale`,
+      });
+    }
+
     created(res, store, 'Negozio creato con successo');
   } catch (err) {
     await client.query('ROLLBACK');
@@ -574,10 +599,22 @@ export const deactivateStore = asyncHandler(async (req: Request, res: Response) 
     [storeId, targetCompanyId]
   );
   // Sync terminal status to inactive
-  await query(
-    `UPDATE users SET status = 'inactive' WHERE store_id = $1 AND company_id = $2 AND role = 'store_terminal'`,
+  const deactivated = await query<{ id: number; name: string | null }>(
+    `UPDATE users SET status = 'inactive' WHERE store_id = $1 AND company_id = $2 AND role = 'store_terminal' AND status = 'active'
+     RETURNING id, name`,
     [storeId, targetCompanyId]
   );
+
+  // Billing ledger: these terminals stop counting towards the billed headcount.
+  for (const t of deactivated) {
+    void recordHeadcountEvent({
+      companyId: targetCompanyId,
+      resourceType: 'terminal',
+      changeType: 'removed',
+      userId: t.id,
+      userLabel: `${t.name ?? store?.name ?? ''} - Terminale`.trim(),
+    });
+  }
 
   ok(res, store, 'Negozio disattivato');
 });
@@ -712,6 +749,20 @@ export const activateStore = asyncHandler(async (req: Request, res: Response) =>
     return;
   }
 
+  // Reactivating the store switches its terminals back on, and an active
+  // terminal is billable — so the licenses are checked before anything is
+  // changed. Refusing the whole reactivation keeps the store and its terminal
+  // in step: a store that is open with a dead QR terminal is worse than one
+  // that is still closed with a clear reason.
+  const dormantTerminals = await query<{ id: number; name: string | null }>(
+    `SELECT id, name FROM users
+     WHERE store_id = $1 AND company_id = $2 AND role = 'store_terminal' AND status = 'inactive'`,
+    [storeId, targetCompanyId]
+  );
+  if (dormantTerminals.length > 0) {
+    await assertLicenseCapacity(targetCompanyId, 'terminal', dormantTerminals.length);
+  }
+
   const store = await queryOne<StoreRow>(
     `UPDATE stores SET is_active = true WHERE id = $1 AND company_id = $2 AND is_active = false RETURNING *`,
     [storeId, targetCompanyId]
@@ -723,6 +774,17 @@ export const activateStore = asyncHandler(async (req: Request, res: Response) =>
     `UPDATE users SET status = 'active' WHERE store_id = $1 AND company_id = $2 AND role = 'store_terminal'`,
     [storeId, targetCompanyId]
   );
+
+  // Billing ledger: they count again from now on.
+  for (const t of dormantTerminals) {
+    void recordHeadcountEvent({
+      companyId: targetCompanyId,
+      resourceType: 'terminal',
+      changeType: 'added',
+      userId: t.id,
+      userLabel: `${t.name ?? store.name} - Terminale`,
+    });
+  }
 
   ok(res, store, 'Negozio riattivato');
 });

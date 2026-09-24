@@ -33,7 +33,10 @@ import {
   subscriptionService,
   announceBillingChange,
   syncSubscriptionPricing,
+  notifyReductionCappedOnce,
 } from '../modules/billing/subscription.service';
+import { countBillableResources } from '../modules/billing/headcount.service';
+import { applyReductionFloor } from '../modules/billing/license.service';
 
 /**
  * Applies license reductions the admin scheduled during the period.
@@ -56,14 +59,34 @@ export async function processBillingRenewalReconciliations() {
 
     for (const sub of subRes.rows) {
       try {
-        const targetSeats =
-          sub.pending_seat_quantity !== null ? sub.pending_seat_quantity : sub.seat_quantity;
-        const targetDevices =
-          sub.pending_device_quantity !== null ? sub.pending_device_quantity : sub.device_quantity;
+        // The reduction was checked against usage when it was requested, and
+        // usage has had a whole period to move since. Live counts are the floor
+        // here, so a company can never end a renewal with more active people
+        // than licences; whatever cannot be applied stays pending for next time.
+        const liveCounts = await countBillableResources(sub.company_id);
+        const reduction = applyReductionFloor({
+          currentSeats: sub.seat_quantity,
+          currentDevices: sub.device_quantity,
+          requestedSeats: sub.pending_seat_quantity,
+          requestedDevices: sub.pending_device_quantity,
+          inUseEmployees: liveCounts.employeeCount,
+          inUseTerminals: liveCounts.deviceCount,
+        });
+        const targetSeats = reduction.seats;
+        const targetDevices = reduction.devices;
 
         console.log(
           `[BillingJob] Applying scheduled license reduction for ${sub.company_name} (seats ${sub.seat_quantity} -> ${targetSeats}, terminals ${sub.device_quantity} -> ${targetDevices})`
         );
+
+        if (reduction.seatsCapped || reduction.devicesCapped) {
+          console.warn(
+            `[BillingJob] Reduction capped by usage for ${sub.company_name}: ` +
+              `asked for seats ${sub.pending_seat_quantity ?? '-'} / terminals ${sub.pending_device_quantity ?? '-'}, ` +
+              `applied ${targetSeats} / ${targetDevices} against ${liveCounts.employeeCount} active employees and ` +
+              `${liveCounts.deviceCount} active terminals. The request stays pending.`
+          );
+        }
 
         if (sub.provider_subscription_id) {
           const gateway = getPaymentGateway(sub.provider);
@@ -82,12 +105,35 @@ export async function processBillingRenewalReconciliations() {
           `UPDATE subscriptions
            SET seat_quantity = $1,
                device_quantity = $2,
-               pending_seat_quantity = NULL,
-               pending_device_quantity = NULL,
+               pending_seat_quantity = $4,
+               pending_device_quantity = $5,
+               reduction_capped_notified_at = CASE
+                 WHEN $4::int IS NULL AND $5::int IS NULL THEN NULL
+                 ELSE reduction_capped_notified_at
+               END,
                updated_at = NOW()
            WHERE id = $3`,
-          [targetSeats, targetDevices, sub.id]
+          [
+            targetSeats,
+            targetDevices,
+            sub.id,
+            reduction.keepPendingSeats,
+            reduction.keepPendingDevices,
+          ]
         );
+
+        if (reduction.seatsCapped || reduction.devicesCapped) {
+          await notifyReductionCappedOnce({
+            subscriptionId: sub.id,
+            companyId: sub.company_id,
+            requestedSeats: sub.pending_seat_quantity,
+            requestedDevices: sub.pending_device_quantity,
+            appliedSeats: targetSeats,
+            appliedDevices: targetDevices,
+            inUseEmployees: liveCounts.employeeCount,
+            inUseTerminals: liveCounts.deviceCount,
+          });
+        }
       } catch (err: any) {
         console.error(
           `[BillingJob] Error applying reduction for subscription ${sub.id}:`,

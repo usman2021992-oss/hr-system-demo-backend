@@ -117,10 +117,62 @@ export async function syncSubscriptionPricing(
   return pricing;
 }
 
-import { priceLicenseChange, getLicenseSnapshot } from './license.service';
+import { priceLicenseChange, getLicenseSnapshot, applyReductionFloor } from './license.service';
 import { describeTaxConfig, getTaxConfig, loadTaxConfig, taxCentsOnLines } from './tax';
-import { sendPaymentFailedNotices, recordNoticeDelivery } from './billing.notifications';
+import {
+  sendPaymentFailedNotices,
+  recordNoticeDelivery,
+  sendLicenseReductionCappedNotice,
+} from './billing.notifications';
 import { resolveIsoCurrency, UnsupportedCurrencyError } from './currency';
+
+/**
+ * Warns about a licence reduction that usage held back — at most once a cycle.
+ *
+ * Both the renewal webhook and the nightly job can notice the same capped
+ * reduction, and the job looks again every night until it fits. The customer
+ * needs telling, not pestering, so the warning is stamped on the subscription
+ * and not repeated for a week. Never throws: this runs after the money has
+ * already been recorded.
+ */
+export async function notifyReductionCappedOnce(params: {
+  subscriptionId: number;
+  companyId: number;
+  requestedSeats: number | null;
+  requestedDevices: number | null;
+  appliedSeats: number;
+  appliedDevices: number;
+  inUseEmployees: number;
+  inUseTerminals: number;
+}): Promise<void> {
+  try {
+    const claim = await pool.query(
+      `UPDATE subscriptions
+          SET reduction_capped_notified_at = NOW()
+        WHERE id = $1
+          AND (reduction_capped_notified_at IS NULL
+               OR reduction_capped_notified_at < NOW() - INTERVAL '7 days')
+        RETURNING id`,
+      [params.subscriptionId]
+    );
+    if (claim.rowCount === 0) return;
+
+    const company = await pool.query(`SELECT name FROM companies WHERE id = $1`, [params.companyId]);
+
+    await sendLicenseReductionCappedNotice({
+      companyId: params.companyId,
+      companyName: company.rows[0]?.name ?? `#${params.companyId}`,
+      requestedSeats: params.requestedSeats,
+      requestedDevices: params.requestedDevices,
+      appliedSeats: params.appliedSeats,
+      appliedDevices: params.appliedDevices,
+      inUseEmployees: params.inUseEmployees,
+      inUseTerminals: params.inUseTerminals,
+    });
+  } catch (err: any) {
+    console.error('[Billing] Could not send the capped-reduction notice:', err?.message || err);
+  }
+}
 
 /**
  * What an increase actually costs mid-cycle.
@@ -800,16 +852,43 @@ export class SubscriptionService {
 
       // Licenses are what was bought. They only shrink when the admin asked for
       // a reduction, and only as a new period starts.
+      //
+      // A reduction is checked against usage when it is requested, but usage
+      // moves before it lands: deactivate 3, ask to go 10 -> 7, hire 3 again,
+      // and applying 7 would leave 10 active people on 7 licenses. So the live
+      // counts are the floor, what was already paid for is the ceiling, and a
+      // reduction that cannot be reached stays pending for a later renewal.
+      const liveCounts = await countBillableResources(sub.company_id, client);
+      const reduction = applyReductionFloor({
+        currentSeats: sub.seat_quantity,
+        currentDevices: sub.device_quantity,
+        requestedSeats: hasPendingUpgrade ? null : sub.pending_seat_quantity,
+        requestedDevices: hasPendingUpgrade ? null : sub.pending_device_quantity,
+        inUseEmployees: liveCounts.employeeCount,
+        inUseTerminals: liveCounts.deviceCount,
+      });
+
       const nextSeatQty = hasPendingUpgrade
         ? (sub.requested_seat_quantity ?? sub.seat_quantity)
-        : sub.pending_seat_quantity !== null
-          ? sub.pending_seat_quantity
-          : sub.seat_quantity;
+        : reduction.seats;
       const nextDevQty = hasPendingUpgrade
         ? (sub.requested_device_quantity ?? sub.device_quantity)
-        : sub.pending_device_quantity !== null
-          ? sub.pending_device_quantity
-          : sub.device_quantity;
+        : reduction.devices;
+
+      // An upgrade leaves any scheduled reduction untouched; otherwise the part
+      // of the reduction that could not be applied waits for the next renewal.
+      const keepPendingSeats = hasPendingUpgrade ? sub.pending_seat_quantity : reduction.keepPendingSeats;
+      const keepPendingDevices = hasPendingUpgrade ? sub.pending_device_quantity : reduction.keepPendingDevices;
+      const reductionWasCapped = !hasPendingUpgrade && (reduction.seatsCapped || reduction.devicesCapped);
+
+      if (reductionWasCapped) {
+        console.warn(
+          `[Billing] Scheduled reduction capped by usage for company ${sub.company_id}: ` +
+            `seats ${sub.pending_seat_quantity ?? '-'} -> ${nextSeatQty} (${liveCounts.employeeCount} active), ` +
+            `terminals ${sub.pending_device_quantity ?? '-'} -> ${nextDevQty} (${liveCounts.deviceCount} active). ` +
+            'The request stays pending.'
+        );
+      }
 
       const now = new Date();
       const periodStart = event.currentPeriodStart || now;
@@ -857,8 +936,13 @@ export class SubscriptionService {
              -- Clear the invoice pointer too, so a later reconcile cannot look
              -- up an upgrade that has already been settled.
              requested_invoice_id = NULL,
-             pending_seat_quantity = CASE WHEN $6::boolean THEN pending_seat_quantity ELSE NULL END,
-             pending_device_quantity = CASE WHEN $6::boolean THEN pending_device_quantity ELSE NULL END,
+             pending_seat_quantity = $6,
+             pending_device_quantity = $7,
+             -- Cleared once nothing is being held back, so a later cap warns again.
+             reduction_capped_notified_at = CASE
+               WHEN $6::int IS NULL AND $7::int IS NULL THEN NULL
+               ELSE reduction_capped_notified_at
+             END,
              current_period_start = $3,
              current_period_end = $4,
              grace_period_ends_at = NULL,
@@ -866,7 +950,15 @@ export class SubscriptionService {
              payment_failed_notified_at = NULL,
              updated_at = NOW()
          WHERE id = $5`,
-        [nextSeatQty, nextDevQty, effectivePeriodStart, effectivePeriodEnd, sub.id, hasPendingUpgrade]
+        [
+          nextSeatQty,
+          nextDevQty,
+          effectivePeriodStart,
+          effectivePeriodEnd,
+          sub.id,
+          keepPendingSeats,
+          keepPendingDevices,
+        ]
       );
 
       // If an existing activation transaction for this subscription is missing invoice_url, update it
@@ -991,6 +1083,22 @@ export class SubscriptionService {
 
       await client.query('COMMIT');
       announceBillingChange(sub.company_id, 'payment');
+
+      // After the commit: the customer is paying for more licences than they
+      // asked for, so they and the operator are told. Not inside the
+      // transaction — a slow mail server must not hold a billing write open.
+      if (reductionWasCapped) {
+        void notifyReductionCappedOnce({
+          subscriptionId: sub.id,
+          companyId: sub.company_id,
+          requestedSeats: sub.pending_seat_quantity,
+          requestedDevices: sub.pending_device_quantity,
+          appliedSeats: nextSeatQty,
+          appliedDevices: nextDevQty,
+          inUseEmployees: liveCounts.employeeCount,
+          inUseTerminals: liveCounts.deviceCount,
+        });
+      }
     } catch (err) {
       await client.query('ROLLBACK');
       throw err;
@@ -1482,6 +1590,8 @@ export class SubscriptionService {
         `UPDATE subscriptions
          SET pending_seat_quantity = $1,
              pending_device_quantity = $2,
+             -- A fresh request: if this one is ever capped, warn about it again.
+             reduction_capped_notified_at = NULL,
              updated_at = NOW()
          WHERE id = $3`,
         [newEmployees, newTerminals, sub.id]
@@ -1527,6 +1637,8 @@ export class SubscriptionService {
         `UPDATE subscriptions
          SET pending_seat_quantity = $1,
              pending_device_quantity = $2,
+             -- A fresh request: if this one is ever capped, warn about it again.
+             reduction_capped_notified_at = NULL,
              updated_at = NOW()
          WHERE id = $3`,
         [newEmployees, newTerminals, sub.id]
@@ -2084,7 +2196,10 @@ export class SubscriptionService {
         c.price_per_employee, c.price_per_device,
         c.bill_reminder_days_before, c.grace_period_days,
         (SELECT COUNT(*)::int FROM users u WHERE u.company_id = c.id AND u.status = 'active' AND u.role != 'store_terminal') AS employee_count,
+        -- Paired to a device, and billable (every active terminal) — the second
+        -- is what the licence gate and the invoice count.
         (SELECT COUNT(*)::int FROM users u WHERE u.company_id = c.id AND u.status = 'active' AND u.role = 'store_terminal' AND (u.registered_device_token IS NOT NULL OR u.registered_device_identifier IS NOT NULL)) AS active_devices_count,
+        (SELECT COUNT(*)::int FROM users u WHERE u.company_id = c.id AND u.status = 'active' AND u.role = 'store_terminal') AS billable_terminals_count,
         s.id AS subscription_id,
         s.provider,
         s.status AS subscription_status,
