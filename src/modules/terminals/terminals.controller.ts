@@ -6,6 +6,8 @@ import { assertLicenseCapacity } from '../billing/license.service';
 import bcrypt from 'bcryptjs';
 import { resolveAllowedCompanyIds } from '../../utils/companyScope';
 import { revokeAllRefreshTokensForUser } from '../auth/refreshTokens';
+import { recordHeadcountEvent } from '../billing/headcount.service';
+import { resolveAreaManagerStoreIds } from '../../utils/storeScope';
 
 /**
  * Whether the terminal has actually completed device registration.
@@ -23,13 +25,88 @@ const REGISTRATION_STATE_SQL = `
     ELSE 'registered'
   END`;
 
+/**
+ * An archived terminal keeps its row, but not its address.
+ *
+ * `users.email` is unique, and the usual reason for archiving a terminal is to
+ * create a fresh one for the same store — normally with the same address. So
+ * the address is parked under a prefix that carries the id, which frees it
+ * immediately and hands it back if the terminal is ever restored.
+ */
+const ARCHIVED_EMAIL_PREFIX = 'deleted:';
+
+function archivedEmail(id: number, email: string): string {
+  return `${ARCHIVED_EMAIL_PREFIX}${id}:${email}`.slice(0, 255);
+}
+
+/** The address an archived terminal had before it was archived. */
+export function originalEmail(email: string): string {
+  const match = /^deleted:\d+:(.+)$/.exec(email);
+  return match ? match[1] : email;
+}
+
+/** Writes the trail for one terminal operation. Never throws. */
+async function recordTerminalAudit(params: {
+  client?: { query: Function };
+  companyId: number;
+  actorId: number;
+  action: string;
+  terminalId: number;
+  details?: Record<string, unknown>;
+}): Promise<void> {
+  const runner = params.client ?? { query };
+  try {
+    await runner.query(
+      `INSERT INTO audit_logs (company_id, user_id, action, entity_type, entity_id, new_data)
+       VALUES ($1, $2, $3, 'user', $4, $5)`,
+      [params.companyId, params.actorId, params.action, params.terminalId, params.details ?? null],
+    );
+  } catch (err: any) {
+    console.error(`[Terminals] Could not record ${params.action}:`, err?.message || err);
+  }
+}
+
+interface ScopedTerminal {
+  id: number;
+  company_id: number;
+  store_id: number | null;
+  name: string | null;
+  email: string;
+  status: string;
+  deleted_at: string | null;
+}
+
+/**
+ * The terminal, when the caller may act on it. `includeArchived` is for the
+ * Super Admin's deleted view; every other path refuses to touch an archived row.
+ */
+async function resolveTerminal(
+  req: Request,
+  terminalId: number,
+  includeArchived = false,
+): Promise<ScopedTerminal | null> {
+  const allowedCompanyIds = await resolveAllowedCompanyIds(req.user!);
+  return queryOne<ScopedTerminal>(
+    `SELECT u.id, u.company_id, u.store_id, u.name, u.email, u.status, u.deleted_at
+     FROM users u
+     WHERE u.id = $1 AND u.role = 'store_terminal' AND u.company_id = ANY($2)
+       ${includeArchived ? '' : 'AND u.deleted_at IS NULL'}`,
+    [terminalId, allowedCompanyIds],
+  );
+}
+
 export const listTerminals = asyncHandler(async (req: Request, res: Response) => {
   const { role, userId, companyId: callerCompanyId } = req.user!;
   const { search, status, registration, company_id, store_id, page = '1', limit = '20' } = req.query as Record<string, string>;
 
   const allowedCompanyIds = await resolveAllowedCompanyIds(req.user!);
   
-  let where = "u.role = 'store_terminal'";
+  // The deleted view belongs to the Super Admin alone; everyone else only ever
+  // sees live terminals.
+  const wantsArchived = String((req.query as Record<string, string>).deleted ?? '') === 'true';
+  const showArchived = wantsArchived && req.user!.is_super_admin === true;
+
+  let where = `u.role = 'store_terminal' AND u.deleted_at IS ${showArchived ? 'NOT NULL' : 'NULL'}`;
   const params: any[] = [];
 
   // Company filtering based on role and query
@@ -49,6 +126,26 @@ export const listTerminals = asyncHandler(async (req: Request, res: Response) =>
   } else {
     params.push(allowedCompanyIds);
     where += ` AND u.company_id = ANY($${params.length})`;
+  }
+
+  // A store manager sees their own store's terminal, an area manager the ones
+  // in the stores they run. Seeing every terminal in the company is for the
+  // roles that manage them.
+  if (role === 'store_manager') {
+    if (req.user!.storeId == null) {
+      where += ' AND 1=0';
+    } else {
+      params.push(req.user!.storeId);
+      where += ` AND u.store_id = $${params.length}`;
+    }
+  } else if (role === 'area_manager') {
+    const areaStoreIds = await resolveAreaManagerStoreIds(userId, allowedCompanyIds);
+    if (areaStoreIds.length === 0) {
+      where += ' AND 1=0';
+    } else {
+      params.push(areaStoreIds);
+      where += ` AND u.store_id = ANY($${params.length})`;
+    }
   }
 
   // Store filtering
@@ -104,10 +201,13 @@ export const listTerminals = asyncHandler(async (req: Request, res: Response) =>
       u.email, 
       u.role, 
       u.status, 
-      u.company_id, 
+      u.company_id,
       u.store_id,
-      u.plain_password,
+      -- The password is deliberately not here: it is read one terminal at a
+      -- time, by a role allowed to manage terminals, and that read is logged.
       u.device_reset_pending,
+      u.deleted_at,
+      TRIM(CONCAT(db.name, ' ', db.surname)) AS deleted_by_name,
       ((u.registered_device_token IS NOT NULL) OR (u.registered_device_identifier IS NOT NULL)) AS device_registered,
       u.registered_device_registered_at AS device_registered_at,
       u.registered_device_metadata AS device_metadata,
@@ -128,6 +228,7 @@ export const listTerminals = asyncHandler(async (req: Request, res: Response) =>
     LEFT JOIN stores s ON s.id = u.store_id
     LEFT JOIN users cb ON cb.id = u.created_by
     LEFT JOIN users ub ON ub.id = u.updated_by
+    LEFT JOIN users db ON db.id = u.deleted_by
     WHERE ${where}
     ORDER BY c.name, s.name, u.name
     LIMIT $${params.length - 1} OFFSET $${params.length}
@@ -137,7 +238,8 @@ export const listTerminals = asyncHandler(async (req: Request, res: Response) =>
   });
 
   ok(res, {
-    data: terminals,
+    // An archived terminal shows the address it had, not the parked one.
+    data: terminals.map((t: any) => ({ ...t, email: originalEmail(t.email) })),
     meta: {
       total,
       page: pageNum,
@@ -145,6 +247,37 @@ export const listTerminals = asyncHandler(async (req: Request, res: Response) =>
       totalPages: Math.ceil(total / limitNum)
     }
   });
+});
+
+/**
+ * GET /api/terminals/:id/password — the terminal's password, one at a time.
+ *
+ * It used to travel in every list response, which meant any authenticated
+ * employee could read every terminal password in their company and sign in as a
+ * store terminal. Now it is a deliberate, logged read by a role that manages
+ * terminals.
+ */
+export const revealTerminalPassword = asyncHandler(async (req: Request, res: Response) => {
+  const terminalId = parseInt(req.params.id, 10);
+  if (isNaN(terminalId)) return badRequest(res, 'Invalid terminal ID');
+
+  const terminal = await resolveTerminal(req, terminalId);
+  if (!terminal) return notFound(res, 'Terminal not found or access denied');
+
+  const row = await queryOne<{ plain_password: string | null }>(
+    `SELECT plain_password FROM users WHERE id = $1`,
+    [terminalId],
+  );
+
+  await recordTerminalAudit({
+    companyId: terminal.company_id,
+    actorId: req.user!.userId,
+    action: 'TERMINAL_PASSWORD_VIEW',
+    terminalId,
+    details: { email: terminal.email },
+  });
+
+  ok(res, { password: row?.plain_password ?? null });
 });
 
 export const listStoresWithTerminalStatus = asyncHandler(async (req: Request, res: Response) => {
@@ -170,6 +303,9 @@ export const listStoresWithTerminalStatus = asyncHandler(async (req: Request, re
         SELECT 1 FROM users u
         WHERE u.store_id = s.id
         AND u.role = 'store_terminal'
+        -- An archived terminal no longer occupies its store: the whole point of
+        -- archiving one is to be able to set the store up again.
+        AND u.deleted_at IS NULL
       ) as "hasTerminal"
     FROM stores s
     LEFT JOIN companies c ON c.id = s.company_id
@@ -202,7 +338,7 @@ export const createTerminal = asyncHandler(async (req: Request, res: Response) =
   // disabled terminal still occupies the store, and ignoring it allowed a second
   // account to be created for the same store.
   const existingTerminal = await queryOne(
-    "SELECT id FROM users WHERE store_id = $1 AND role = 'store_terminal'",
+    "SELECT id FROM users WHERE store_id = $1 AND role = 'store_terminal' AND deleted_at IS NULL",
     [store_id]
   );
 
@@ -210,7 +346,8 @@ export const createTerminal = asyncHandler(async (req: Request, res: Response) =
     return conflict(res, 'A terminal already exists for this store');
   }
 
-  // Check if email is available
+  // Check if email is available. An archived terminal parks its address, so the
+  // only way this still collides is a live user — worth saying plainly.
   const emailExists = await queryOne('SELECT id FROM users WHERE email = $1', [email]);
   if (emailExists) {
     return conflict(res, 'Email already in use');
@@ -244,6 +381,16 @@ export const createTerminal = asyncHandler(async (req: Request, res: Response) =
     );
 
     await client.query('COMMIT');
+
+    // Billing ledger: this terminal counts from now on.
+    void recordHeadcountEvent({
+      companyId: store.company_id,
+      resourceType: 'terminal',
+      changeType: 'added',
+      userId: terminalRes.rows[0].id,
+      userLabel: `${store.name} - Terminale`,
+    });
+
     created(res, { ...terminalRes.rows[0], registration_state: 'pending' }, 'Terminal created successfully');
   } catch (err) {
     await client.query('ROLLBACK');
@@ -263,8 +410,9 @@ export const updateTerminal = asyncHandler(async (req: Request, res: Response) =
   // Verify terminal exists, is a terminal, and is in scope
   const terminal = await queryOne<{ id: number; company_id: number; email: string; plain_password?: string }>(
     `SELECT u.id, u.company_id, u.email, u.plain_password
-     FROM users u 
-     WHERE u.id = $1 AND u.role = 'store_terminal' AND u.company_id = ANY($2)`,
+     FROM users u
+     WHERE u.id = $1 AND u.role = 'store_terminal' AND u.company_id = ANY($2)
+       AND u.deleted_at IS NULL`,
     [terminalId, allowedCompanyIds]
   );
 
@@ -321,39 +469,265 @@ export const updateTerminal = asyncHandler(async (req: Request, res: Response) =
   ok(res, null, 'Terminal updated successfully');
 });
 
+/**
+ * DELETE /api/terminals/:id — archives the terminal.
+ *
+ * It used to delete the user row together with its attendance_events and every
+ * audit_logs row naming it, so a terminal could vanish with no trace of having
+ * existed. Now it is archived: the row and its history stay, the account stops
+ * working and stops being billable, it leaves every list, and it waits in the
+ * Super Admin's deleted view to be restored or removed for good.
+ */
 export const deleteTerminal = asyncHandler(async (req: Request, res: Response) => {
   const terminalId = parseInt(req.params.id, 10);
-  const allowedCompanyIds = await resolveAllowedCompanyIds(req.user!);
-
   if (isNaN(terminalId)) return badRequest(res, 'Invalid terminal ID');
 
-  // Verify terminal exists, is a terminal, and is in scope
-  const terminal = await queryOne(
-    `SELECT u.id, u.company_id 
-     FROM users u 
-     WHERE u.id = $1 AND u.role = 'store_terminal' AND u.company_id = ANY($2)`,
-    [terminalId, allowedCompanyIds]
-  );
-
+  const terminal = await resolveTerminal(req, terminalId);
   if (!terminal) return notFound(res, 'Terminal not found or access denied');
+
+  const wasActive = terminal.status === 'active';
 
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
 
-    // Clean up dependencies
-    await client.query('DELETE FROM attendance_events WHERE user_id = $1', [terminalId]);
-    await client.query('DELETE FROM audit_logs WHERE user_id = $1', [terminalId]);
-    
-    // Delete the terminal user
-    await client.query('DELETE FROM users WHERE id = $1', [terminalId]);
+    await client.query(
+      `UPDATE users
+          SET deleted_at = NOW(),
+              deleted_by = $2,
+              status = 'inactive',
+              email = $3,
+              -- Release the tablet as well. The device token is unique across
+              -- users, so leaving it here would stop the same tablet being set
+              -- up again on the terminal that replaces this one.
+              registered_device_token = NULL,
+              registered_device_identifier = NULL,
+              registered_device_metadata = NULL,
+              device_reset_pending = false,
+              updated_by = $2,
+              updated_at = NOW()
+        WHERE id = $1`,
+      [terminalId, req.user!.userId, archivedEmail(terminalId, terminal.email)],
+    );
+
+    await recordTerminalAudit({
+      client,
+      companyId: terminal.company_id,
+      actorId: req.user!.userId,
+      action: 'TERMINAL_ARCHIVE',
+      terminalId,
+      details: { email: terminal.email, store_id: terminal.store_id, was_active: wasActive },
+    });
 
     await client.query('COMMIT');
-    ok(res, null, 'Terminal deleted successfully');
   } catch (err) {
     await client.query('ROLLBACK');
     throw err;
   } finally {
     client.release();
   }
+
+  // The archived account must not keep a live session.
+  await revokeAllRefreshTokensForUser(terminalId).catch(() => undefined);
+
+  // Billing: an archived terminal is inactive, so it stops counting.
+  if (wasActive) {
+    void recordHeadcountEvent({
+      companyId: terminal.company_id,
+      resourceType: 'terminal',
+      changeType: 'removed',
+      userId: terminalId,
+      userLabel: terminal.name ?? terminal.email,
+    });
+  }
+
+  ok(res, null, 'Terminal moved to deleted');
+});
+
+/**
+ * POST /api/terminals/:id/restore — Super Admin only.
+ *
+ * Comes back inactive on purpose: reactivating it is a separate, licence-checked
+ * step, so restoring something from the bin can never quietly add to the bill.
+ */
+export const restoreTerminal = asyncHandler(async (req: Request, res: Response) => {
+  const terminalId = parseInt(req.params.id, 10);
+  if (isNaN(terminalId)) return badRequest(res, 'Invalid terminal ID');
+
+  const terminal = await resolveTerminal(req, terminalId, true);
+  if (!terminal || !terminal.deleted_at) {
+    return notFound(res, 'Deleted terminal not found or access denied');
+  }
+
+  // Give the address back if nothing has taken it in the meantime.
+  const wanted = originalEmail(terminal.email);
+  const taken = await queryOne<{ id: number }>(
+    `SELECT id FROM users WHERE email = $1 AND id <> $2`,
+    [wanted, terminalId],
+  );
+  const restoredEmail = taken ? terminal.email : wanted;
+
+  // The store may have been given a new terminal while this one was archived;
+  // two live terminals on one store is exactly what createTerminal prevents.
+  if (terminal.store_id !== null) {
+    const occupied = await queryOne<{ id: number }>(
+      `SELECT id FROM users
+        WHERE store_id = $1 AND role = 'store_terminal' AND deleted_at IS NULL AND id <> $2`,
+      [terminal.store_id, terminalId],
+    );
+    if (occupied) {
+      return conflict(
+        res,
+        'This store already has a terminal. Delete that one first, or reassign this terminal to another store.',
+        'STORE_HAS_TERMINAL',
+      );
+    }
+  }
+
+  await query(
+    `UPDATE users
+        SET deleted_at = NULL,
+            deleted_by = NULL,
+            email = $2,
+            status = 'inactive',
+            updated_by = $3,
+            updated_at = NOW()
+      WHERE id = $1`,
+    [terminalId, restoredEmail, req.user!.userId],
+  );
+
+  await recordTerminalAudit({
+    companyId: terminal.company_id,
+    actorId: req.user!.userId,
+    action: 'TERMINAL_RESTORE',
+    terminalId,
+    details: { email: restoredEmail, address_recovered: !taken },
+  });
+
+  ok(
+    res,
+    { id: terminalId, email: restoredEmail, addressRecovered: !taken },
+    taken
+      ? 'Terminal restored. Its old address was taken, so set a new one before activating it.'
+      : 'Terminal restored. It is inactive until you activate it.',
+  );
+});
+
+/**
+ * DELETE /api/terminals/:id/permanent — Super Admin only, and only from the bin.
+ *
+ * Refuses while anything irreplaceable still points at the row. The audit trail
+ * survives regardless: audit_logs.user_id is ON DELETE SET NULL since migration
+ * 148, so the record of what happened outlives the account it happened to.
+ */
+export const permanentlyDeleteTerminal = asyncHandler(async (req: Request, res: Response) => {
+  const terminalId = parseInt(req.params.id, 10);
+  if (isNaN(terminalId)) return badRequest(res, 'Invalid terminal ID');
+
+  const terminal = await resolveTerminal(req, terminalId, true);
+  if (!terminal || !terminal.deleted_at) {
+    return notFound(res, 'Deleted terminal not found or access denied');
+  }
+
+  // Attendance rows are attributed to the employee who scanned, so a terminal
+  // normally owns none. If it somehow does, that is history — refuse rather
+  // than delete it, and say so.
+  const attendance = await queryOne<{ count: number }>(
+    `SELECT COUNT(*)::int AS count FROM attendance_events WHERE user_id = $1`,
+    [terminalId],
+  );
+  if ((attendance?.count ?? 0) > 0) {
+    return conflict(
+      res,
+      `This terminal has ${attendance!.count} attendance records attached and cannot be deleted permanently. It stays in the deleted list.`,
+      'TERMINAL_HAS_ATTENDANCE',
+    );
+  }
+
+  await recordTerminalAudit({
+    companyId: terminal.company_id,
+    actorId: req.user!.userId,
+    action: 'TERMINAL_DELETE_PERMANENT',
+    terminalId,
+    details: { email: originalEmail(terminal.email), store_id: terminal.store_id },
+  });
+
+  await query(`DELETE FROM users WHERE id = $1`, [terminalId]);
+
+  ok(res, null, 'Terminal permanently deleted');
+});
+
+/** PATCH /api/terminals/:id/deactivate — stops the account without archiving it. */
+export const deactivateTerminal = asyncHandler(async (req: Request, res: Response) => {
+  const terminalId = parseInt(req.params.id, 10);
+  if (isNaN(terminalId)) return badRequest(res, 'Invalid terminal ID');
+
+  const terminal = await resolveTerminal(req, terminalId);
+  if (!terminal) return notFound(res, 'Terminal not found or access denied');
+  if (terminal.status !== 'active') return badRequest(res, 'Terminal is already inactive');
+
+  await query(
+    `UPDATE users SET status = 'inactive', updated_by = $2, updated_at = NOW() WHERE id = $1`,
+    [terminalId, req.user!.userId],
+  );
+
+  await revokeAllRefreshTokensForUser(terminalId).catch(() => undefined);
+
+  await recordTerminalAudit({
+    companyId: terminal.company_id,
+    actorId: req.user!.userId,
+    action: 'TERMINAL_DEACTIVATE',
+    terminalId,
+    details: { email: terminal.email },
+  });
+
+  void recordHeadcountEvent({
+    companyId: terminal.company_id,
+    resourceType: 'terminal',
+    changeType: 'removed',
+    userId: terminalId,
+    userLabel: terminal.name ?? terminal.email,
+  });
+
+  ok(res, { id: terminalId, status: 'inactive' }, 'Terminal deactivated');
+});
+
+/**
+ * PATCH /api/terminals/:id/activate — puts it back to work.
+ *
+ * An active terminal is billable, so this goes through the same licence gate as
+ * creating one.
+ */
+export const activateTerminal = asyncHandler(async (req: Request, res: Response) => {
+  const terminalId = parseInt(req.params.id, 10);
+  if (isNaN(terminalId)) return badRequest(res, 'Invalid terminal ID');
+
+  const terminal = await resolveTerminal(req, terminalId);
+  if (!terminal) return notFound(res, 'Terminal not found or access denied');
+  if (terminal.status === 'active') return badRequest(res, 'Terminal is already active');
+
+  await assertLicenseCapacity(terminal.company_id, 'terminal', 1);
+
+  await query(
+    `UPDATE users SET status = 'active', updated_by = $2, updated_at = NOW() WHERE id = $1`,
+    [terminalId, req.user!.userId],
+  );
+
+  await recordTerminalAudit({
+    companyId: terminal.company_id,
+    actorId: req.user!.userId,
+    action: 'TERMINAL_ACTIVATE',
+    terminalId,
+    details: { email: terminal.email },
+  });
+
+  void recordHeadcountEvent({
+    companyId: terminal.company_id,
+    resourceType: 'terminal',
+    changeType: 'added',
+    userId: terminalId,
+    userLabel: terminal.name ?? terminal.email,
+  });
+
+  ok(res, { id: terminalId, status: 'active' }, 'Terminal activated');
 });

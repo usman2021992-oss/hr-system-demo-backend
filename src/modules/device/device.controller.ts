@@ -90,6 +90,9 @@ async function findConflictingRegistration(
      FROM users
      WHERE id <> $1
        AND device_reset_pending = false
+       -- An archived account cannot hold a tablet hostage: deleting a terminal
+       -- and setting the same tablet up again on its replacement must just work.
+       AND deleted_at IS NULL
        ${companyClause}
        AND (
          registered_device_token = $2
