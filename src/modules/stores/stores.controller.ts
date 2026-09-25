@@ -601,6 +601,7 @@ export const deactivateStore = asyncHandler(async (req: Request, res: Response) 
   // Sync terminal status to inactive
   const deactivated = await query<{ id: number; name: string | null }>(
     `UPDATE users SET status = 'inactive' WHERE store_id = $1 AND company_id = $2 AND role = 'store_terminal' AND status = 'active'
+       AND deleted_at IS NULL
      RETURNING id, name`,
     [storeId, targetCompanyId]
   );
@@ -754,9 +755,12 @@ export const activateStore = asyncHandler(async (req: Request, res: Response) =>
   // changed. Refusing the whole reactivation keeps the store and its terminal
   // in step: a store that is open with a dead QR terminal is worse than one
   // that is still closed with a clear reason.
+  // An archived terminal stays archived: reopening a store must not bring back
+  // a terminal an admin deleted, nor charge for it.
   const dormantTerminals = await query<{ id: number; name: string | null }>(
     `SELECT id, name FROM users
-     WHERE store_id = $1 AND company_id = $2 AND role = 'store_terminal' AND status = 'inactive'`,
+     WHERE store_id = $1 AND company_id = $2 AND role = 'store_terminal' AND status = 'inactive'
+       AND deleted_at IS NULL`,
     [storeId, targetCompanyId]
   );
   if (dormantTerminals.length > 0) {
@@ -771,7 +775,8 @@ export const activateStore = asyncHandler(async (req: Request, res: Response) =>
 
   // Sync terminal status to active
   await query(
-    `UPDATE users SET status = 'active' WHERE store_id = $1 AND company_id = $2 AND role = 'store_terminal'`,
+    `UPDATE users SET status = 'active' WHERE store_id = $1 AND company_id = $2 AND role = 'store_terminal'
+       AND deleted_at IS NULL`,
     [storeId, targetCompanyId]
   );
 

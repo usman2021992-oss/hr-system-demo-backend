@@ -139,7 +139,9 @@ export function isDefaultEnabledForModule(role: UserRole, moduleName: ModuleName
   if (moduleName === 'presenze' && role === 'store_terminal') return true;
   if (moduleName === 'trasferimenti' && (role === 'hr' || role === 'area_manager' || role === 'store_manager')) return true;
   if (moduleName === 'negozi' && (role === 'hr' || role === 'area_manager' || role === 'store_terminal')) return true;
-  if (moduleName === 'terminali' && (role === 'hr' || role === 'area_manager')) return true;
+  // Store managers see terminals too: they need to know whether their own store
+  // is set up. Only admin and hr can change one, which the routes enforce.
+  if (moduleName === 'terminali' && (role === 'hr' || role === 'area_manager' || role === 'store_manager')) return true;
   if (moduleName === 'dipendenti' && role === 'employee') return true;
   if (moduleName === 'documenti' && (role === 'employee' || role === 'store_manager' || role === 'area_manager' || role === 'hr')) return true;
   if (moduleName === 'ats' && role === 'hr') return true;

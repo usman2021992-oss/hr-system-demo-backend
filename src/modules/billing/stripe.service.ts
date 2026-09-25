@@ -934,9 +934,44 @@ export class StripeGateway implements IPaymentGateway {
    * helpers below need it. Best effort: a webhook must not fail because a
    * follow-up read did.
    */
+  /**
+   * The payment intent behind an invoice, whichever shape the payload arrived in.
+   *
+   * Same story as resolveInvoiceSubscriptionId: Stripe moved this field. Older
+   * API versions put `payment_intent` on the invoice; newer ones (2025-03 basil
+   * onwards) drop it and expose the payments under `invoice.payments`. A webhook
+   * is rendered in the API version configured on the *account*, not the one this
+   * client is pinned to, so the field can simply be absent — and then the decline
+   * reason was never read and the customer got the generic message instead of
+   * "your card has expired".
+   *
+   * Last resort: fetch the invoice again through this client, which renders it
+   * in the pinned version, where the field does exist.
+   */
   private async retrieveInvoicePaymentIntent(invoice: any): Promise<any | null> {
     try {
-      const pi = invoice?.payment_intent;
+      let pi = invoice?.payment_intent;
+
+      // Newer payload shape: payments[].payment.payment_intent
+      if (!pi) {
+        for (const payment of invoice?.payments?.data ?? []) {
+          const candidate = payment?.payment?.payment_intent ?? payment?.payment_intent;
+          if (candidate) { pi = candidate; break; }
+        }
+      }
+
+      // Still nothing: re-read the invoice in the version this client speaks.
+      if (!pi && invoice?.id) {
+        const fresh: any = await this.stripe.invoices.retrieve(invoice.id);
+        pi = fresh?.payment_intent;
+        if (!pi) {
+          for (const payment of fresh?.payments?.data ?? []) {
+            const candidate = payment?.payment?.payment_intent ?? payment?.payment_intent;
+            if (candidate) { pi = candidate; break; }
+          }
+        }
+      }
+
       if (!pi) return null;
       if (typeof pi !== 'string') return pi;
       return await this.stripe.paymentIntents.retrieve(pi);
