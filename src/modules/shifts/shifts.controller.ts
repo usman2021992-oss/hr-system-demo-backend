@@ -253,6 +253,73 @@ async function cancelWorkingShiftsForOffDay(params: {
   );
 }
 
+/**
+ * How long after a shift ends we still call a missing clock-out "in progress".
+ *
+ * People clock out late — the till, a customer, a delivery. Marking a shift
+ * incomplete the second its end time passes would flag half a store every
+ * evening, and a flag that cries wolf gets ignored.
+ */
+const CHECKOUT_GRACE = `INTERVAL '2 hours'`;
+
+/** How far either side of a shift a clock-in with no shift_id may be claimed. */
+const UNLINKED_EVENT_WINDOW = `INTERVAL '6 hours'`;
+
+const SHIFT_END_UTC_SQL = coalescedShiftPointUtcSql('s.end_at_utc', 's.date', 's.end_time', 's.timezone');
+const SHIFT_START_UTC_FOR_ATTENDANCE = coalescedShiftPointUtcSql('s.start_at_utc', 's.date', 's.start_time', 's.timezone');
+
+/**
+ * What actually happened on this shift, from the attendance events.
+ *
+ * Events normally carry the shift they belong to, which is exact and survives a
+ * night shift crossing midnight. Anything recorded without one — an HR
+ * correction, an older sync — is claimed by the nearest shift of the same
+ * employee within a few hours, which is the best that can be said about it.
+ */
+const ATTENDANCE_JOIN = `
+  LEFT JOIN LATERAL (
+    SELECT
+      MIN(ae.event_time) FILTER (WHERE ae.event_type = 'checkin')     AS checkin_at,
+      MAX(ae.event_time) FILTER (WHERE ae.event_type = 'checkout')    AS checkout_at,
+      MIN(ae.event_time) FILTER (WHERE ae.event_type = 'break_start') AS break_start_at,
+      MAX(ae.event_time) FILTER (WHERE ae.event_type = 'break_end')   AS break_end_at,
+      COUNT(*)::int                                                   AS event_count,
+      BOOL_OR(ae.source = 'manual')                                   AS has_manual_event
+    FROM attendance_events ae
+    WHERE ae.user_id = s.user_id
+      AND (
+        ae.shift_id = s.id
+        OR (
+          ae.shift_id IS NULL
+          AND ae.company_id = s.company_id
+          AND ae.event_time >= ${SHIFT_START_UTC_FOR_ATTENDANCE} - ${UNLINKED_EVENT_WINDOW}
+          AND ae.event_time <= ${SHIFT_END_UTC_SQL} + ${UNLINKED_EVENT_WINDOW}
+        )
+      )
+  ) att ON TRUE
+`;
+
+/**
+ * One word for what the calendar should show on the shift.
+ *
+ * 'completed'  clocked in and out
+ * 'in_progress' clocked in, still inside the shift (plus the grace above)
+ * 'incomplete' clocked in, never clocked out, and the grace has passed
+ * 'missed'     the shift has been and gone with nothing recorded
+ * 'scheduled'  still in the future
+ * 'off'/'cancelled' nothing to expect
+ */
+const ATTENDANCE_STATE_SQL = `
+  CASE
+    WHEN s.status = 'cancelled' THEN 'cancelled'
+    WHEN s.is_off_day THEN 'off'
+    WHEN att.checkin_at IS NOT NULL AND att.checkout_at IS NOT NULL THEN 'completed'
+    WHEN att.checkin_at IS NOT NULL AND NOW() < ${SHIFT_END_UTC_SQL} + ${CHECKOUT_GRACE} THEN 'in_progress'
+    WHEN att.checkin_at IS NOT NULL THEN 'incomplete'
+    WHEN NOW() < ${SHIFT_END_UTC_SQL} THEN 'scheduled'
+    ELSE 'missed'
+  END`;
+
 const SHIFT_FIELDS = `
   s.id, s.company_id, s.store_id, s.user_id, s.assignment_id,
   TO_CHAR(s.date::date, 'YYYY-MM-DD') AS date,
@@ -268,13 +335,29 @@ const SHIFT_FIELDS = `
   st.name AS store_name,
   u.name AS user_name, u.surname AS user_surname,
   u.avatar_filename AS user_avatar_filename,
-  ${shiftHoursExpr()}
+  ${shiftHoursExpr()},
+  -- What attendance says about this shift, for the marks on the calendar and
+  -- the timeline behind them.
+  att.checkin_at      AS attendance_checkin_at,
+  att.checkout_at     AS attendance_checkout_at,
+  att.break_start_at  AS attendance_break_start_at,
+  att.break_end_at    AS attendance_break_end_at,
+  COALESCE(att.event_count, 0)        AS attendance_event_count,
+  COALESCE(att.has_manual_event, false) AS attendance_has_manual_event,
+  ${ATTENDANCE_STATE_SQL} AS attendance_state,
+  -- Minutes between the shift's start and the clock-in: positive is late,
+  -- negative is early. Null when there was no clock-in.
+  CASE
+    WHEN att.checkin_at IS NULL THEN NULL
+    ELSE ROUND(EXTRACT(EPOCH FROM (att.checkin_at - ${SHIFT_START_UTC_FOR_ATTENDANCE})) / 60)::int
+  END AS attendance_checkin_delay_minutes
 `;
 
 const BASE_JOINS = `
   FROM shifts s
   LEFT JOIN stores st ON st.id = s.store_id
   LEFT JOIN users u   ON u.id  = s.user_id
+  ${ATTENDANCE_JOIN}
 `;
 
 const SHIFT_START_UTC_SQL = coalescedShiftPointUtcSql('s.start_at_utc', 's.date', 's.start_time', 's.timezone');
